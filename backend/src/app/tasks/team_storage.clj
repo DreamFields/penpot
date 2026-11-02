@@ -30,12 +30,16 @@
   "Dirty teams first, then the ones nobody refreshed for a week. The
   second branch is the self-healing path: a mark lost on the way (an
   audit insert that failed, a flag that was off) would otherwise keep
-  the counter low for ever. The table holds one row per team, so the
-  stale branch needs no index."
+  the counter low for ever.
+
+  Each branch spells the predicate of its partial index (`dirty_at IS
+  NOT NULL` and `dirty_at IS NULL`), so the planner answers the OR with a
+  BitmapOr of the two index scans and only sorts the rows it is going to
+  enqueue, never the whole table."
   "SELECT team_id
      FROM team_storage_usage
     WHERE dirty_at IS NOT NULL
-       OR updated_at < now() - interval '7 days'
+       OR (dirty_at IS NULL AND updated_at < now() - interval '7 days')
     ORDER BY dirty_at ASC NULLS LAST, updated_at ASC")
 
 (def ^:private sql:upsert-team-storage-usage

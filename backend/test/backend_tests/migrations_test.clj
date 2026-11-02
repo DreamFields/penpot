@@ -258,6 +258,71 @@
     (t/is (contains? (table-indexes "audit_log") "audit_log__xid__seq__idx"))
     (t/is (contains? (table-columns "audit_log_consumer_cursor") "consumer"))))
 
+(defn- indexdef-of
+  [table index-name]
+  (:indexdef (th/db-exec-one! ["SELECT indexdef FROM pg_indexes
+                                 WHERE schemaname = 'public'
+                                   AND tablename = ?
+                                   AND indexname = ?"
+                               table index-name])))
+
+(t/deftest team-storage-updated-at-index-serves-the-stale-branch
+  ;; The scheduler's self-healing branch filters `dirty_at IS NULL`; the
+  ;; partial index is what keeps each branch an index range scan of the
+  ;; rows it is going to enqueue instead of a scan of the whole table.
+  (th/db-exec! ["DROP INDEX IF EXISTS team_storage_usage__updated_at__idx"])
+  (let [apply! (mg/resource "app/migrations/sql/0158-consumer-generalization.sql")]
+    (t/is (true? (apply! th/*pool*))))
+  (let [def (indexdef-of "team_storage_usage" "team_storage_usage__updated_at__idx")]
+    (t/is (some? def))
+    (t/is (str/includes? def "(updated_at)"))
+    (t/is (str/includes? def "dirty_at IS NULL"))))
+
+(defn- sequence-last-value
+  []
+  (:last-value (th/db-exec-one! ["SELECT last_value FROM audit_log_seq_seq"])))
+
+(defn- insert-audit-row!
+  "Insert one row with the columns the previous version filled, so the
+  database gives it `seq` and `xid` from their defaults."
+  []
+  (let [id (uuid/next)]
+    (th/db-exec! ["INSERT INTO audit_log (id, name, type, source, profile_id,
+                                          ip_addr, props, context, tracked_at, created_at)
+                   VALUES (?, 'create-project', 'action', 'backend', ?,
+                           '127.0.0.1', ?, ?, now(), now())"
+                  id uuid/zero (db/tjson {}) (db/tjson {})])
+    id))
+
+(t/deftest the-sequence-reserve-is-only-applied-to-a-fresh-sequence
+  ;; A re-run must not move a sequence that already left its initial value:
+  ;; on the first application it starts at 1 and the migration reserves the
+  ;; low range, so the history gets 1..N and the new rows start above it.
+  (let [apply! (mg/resource "app/migrations/sql/0158-consumer-generalization.sql")
+        before (sequence-last-value)]
+    (try
+      (th/db-exec! ["ALTER SEQUENCE audit_log_seq_seq RESTART WITH 1"])
+      (t/is (true? (apply! th/*pool*)))
+      (t/is (>= (sequence-last-value) 1000000))
+      (finally
+        (th/db-exec! ["SELECT setval('audit_log_seq_seq', ?::bigint, false)" before])))))
+
+(t/deftest the-sequence-reserve-is-not-moved-on-a-rerun
+  ;; Inserting a row advances the sequence; deleting it drops `count(*)`
+  ;; again. The old unconditional setval lowered the sequence in that case.
+  (let [apply! (mg/resource "app/migrations/sql/0158-consumer-generalization.sql")
+        id (insert-audit-row!)]
+    (try
+      (let [before (sequence-last-value)]
+        (th/db-exec! ["DELETE FROM audit_log WHERE id = ?" id])
+        (t/is (true? (apply! th/*pool*)))
+        (t/is (= before (sequence-last-value)))
+        (let [max-seq (:max (th/db-exec-one! ["SELECT max(seq) AS max FROM audit_log"]))
+              next    (:next (th/db-exec-one! ["SELECT nextval('audit_log_seq_seq') AS next"]))]
+          (t/is (> next (or max-seq 0)))))
+      (finally
+        (th/db-exec! ["DELETE FROM audit_log WHERE id = ?" id])))))
+
 (t/deftest job-live-exclusive-index-admits-one-live-row-per-key
   ;; The exclusion of the live jobs is the index, not a check that races
   ;; an insert: it is unique, it covers the whole key, and it only

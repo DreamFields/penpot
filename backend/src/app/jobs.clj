@@ -1075,6 +1075,17 @@
                     :code :orphan
                     :hint "job execution lease expired"}))
 
+(def superseded-error
+  "Error of a `::jobs/dedupe`/`::jobs/debounce` job whose message was lost
+  on the way to its queue and already has a newer `new` row with the same
+  key. The newer row carries the latest params, so the lost one is marked
+  `aborted` (system-side terminal, never retried) with its `end` event in
+  the same transaction instead of going back to `new`: that would violate
+  `job__new_dedupe__uniq` and abort the whole dispatch batch."
+  (check-job-error {:type :internal
+                    :code :superseded
+                    :hint "superseded by a newer submit for the same dedupe key"}))
+
 (def ^:private decode-job-error-value
   (sm/decoder schema:job-error sm/json-transformer))
 

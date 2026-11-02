@@ -102,10 +102,10 @@
 
 (t/deftest storage-usage-mid-recompute-shrink-re-marks-after
   ;; Production flow: a shrink landing mid-recompute is queued but not
-  ;; yet drained, so the upsert clears only the stale mark; the later
-  ;; drain re-marks from the pending and the next tick recomputes.
-  ;; Nothing is lost without a trace: the pending is the durable
-  ;; record.
+  ;; yet drained, so the upsert clears only the stale mark; the row stays
+  ;; unread in audit_log, the later drain re-marks from it and the next
+  ;; tick recomputes. Nothing is lost without a trace: the audit row and
+  ;; the cursor are the durable record.
   (let [prof (th/create-profile* 74 {:is-active true})
         team (:default-team-id prof)
         real @#'quotes/get-live-media-storage-bytes]
@@ -443,6 +443,21 @@
       (t/is (= 1 (th/run-task! :schedule-recompute-team-storage {})))
       (let [rows (th/db-exec! ["SELECT label FROM job WHERE name = 'recompute-team-storage'"])]
         (t/is (= [(str stale)] (mapv :label rows)))))))
+
+(t/deftest storage-usage-scheduler-enqueues-a-dirty-and-stale-team-once
+  ;; A row can carry a mark and be stale at the same time (the mark
+  ;; survived, the refresh is old). The two branches of the scan cover
+  ;; disjoint rows (`dirty_at IS NOT NULL` and `dirty_at IS NULL`), so it
+  ;; is enqueued once: a UNION ALL without the guard would enqueue it
+  ;; twice.
+  (let [prof  (th/create-profile* 88 {:is-active true})
+        team  (:default-team-id prof)
+        old   (ct/in-past {:days 8})]
+    (th/db-insert! :team-storage-usage {:team-id team :total-bytes 10
+                                        :dirty-at old :updated-at old})
+    (with-redefs [cf/flags test-flags]
+      (t/is (= 1 (th/run-task! :schedule-recompute-team-storage {})))
+      (t/is (= 1 (count (th/db-query :job {:name "recompute-team-storage"})))))))
 
 (t/deftest storage-usage-scheduler-enqueues-on-the-storage-queue
   ;; The recompute runs the slow per-team SUM, so it owns a queue:

@@ -38,6 +38,14 @@ CREATE INDEX IF NOT EXISTS team_storage_usage__dirty_at__idx
     ON team_storage_usage (dirty_at ASC, team_id ASC)
  WHERE dirty_at IS NOT NULL;
 
+-- Serves the self-healing branch of the scheduler (rows nobody refreshed
+-- for a week), which filters `dirty_at IS NULL`: a partial index keeps the
+-- dirty rows out, so each branch of the query is an index range scan of
+-- the rows it is going to enqueue instead of a scan of the whole table.
+CREATE INDEX IF NOT EXISTS team_storage_usage__updated_at__idx
+    ON team_storage_usage (updated_at ASC)
+ WHERE dirty_at IS NULL;
+
 -- ---------------------------------------------------------------------
 -- Audit log cursors: each consumer keeps a position over `audit_log`
 -- instead of a pending queue, and the row is deleted when every enabled
@@ -67,9 +75,15 @@ ALTER SEQUENCE audit_log_seq_seq OWNED BY audit_log.seq;
 -- can never collide with a value produced by nextval. The margin covers
 -- the rows the previous version may insert between this count and the
 -- SET DEFAULT (a few statements away).
+--
+-- Only the first application sets it: a sequence that already left its
+-- initial value (1) is reserved by the operator or in use, and a re-run
+-- must leave it alone (moving it back would reuse values above the
+-- history and break the reserve).
 SELECT setval('audit_log_seq_seq',
               (SELECT count(*) + 1000000 FROM audit_log),
-              false);
+              false)
+ WHERE (SELECT last_value FROM audit_log_seq_seq) = 1;
 
 -- From here no new row can be NULL: the previous version keeps inserting
 -- during the rollout and must leave the columns filled.
@@ -178,10 +192,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS job__new_dedupe__uniq
 -- writes. Pre-apply the same statements on their own, outside a transaction
 -- block, in this order.
 --
--- 0. Before anything: disable the legacy archiver (the previous version's
---    consumer task) so two archivers never run in parallel, and delete
---    what it had already archived. On the mark-and-sweep version (the one
---    without the pending queue) that is:
+-- 0. Before anything: stop the legacy archiving **and its GC** for the
+--    whole deploy window, so nothing archives or deletes concurrently. The
+--    consumer flags are the same in both versions, so flipping them is not
+--    enough: stop the old version's workers/cron (or take those instances
+--    out) and check that no legacy consumer job and no `audit-log-gc` job
+--    is pending before going on. The old sweeps delete rows the new
+--    consumers may not have read yet (the new producer no longer fills
+--    `audit_log_pending`, so the old orphan sweep sees every new row as an
+--    orphan) and the old consumers re-send rows the new cursors already
+--    passed; there is no lock that serializes the two versions.
+--
+--    Then delete what the old archiver had already archived. On the
+--    mark-and-sweep version (the one without the pending queue) that is:
 --
 --      DELETE FROM audit_log WHERE archived_at IS NOT NULL;
 --
@@ -191,7 +214,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS job__new_dedupe__uniq
 --    step the buffer is only the backlog that was never archived, so the
 --    replay seeded below does not re-send anything already sent.
 --
--- 1. Team storage: a new table, nothing to lock (copy of the block above).
+-- 1. Team storage: a new table, nothing to lock (copy of the block above,
+--    both indexes included: the one on `dirty_at` and the partial one on
+--    `updated_at` that serves the weekly self-healing sweep).
 --
 -- 2. Audit log: columns first (metadata-only), the reserved low range and
 --    the defaults the previous version needs immediately:
@@ -201,7 +226,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS job__new_dedupe__uniq
 --      ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS xid xid8 NOT NULL DEFAULT '0'::xid8;
 --      ALTER SEQUENCE audit_log_seq_seq OWNED BY audit_log.seq;
 --      SELECT setval('audit_log_seq_seq',
---                    (SELECT count(*) + 1000000 FROM audit_log), false);
+--                    (SELECT count(*) + 1000000 FROM audit_log), false)
+--       WHERE (SELECT last_value FROM audit_log_seq_seq) = 1;
 --      ALTER TABLE audit_log ALTER COLUMN seq SET DEFAULT nextval('audit_log_seq_seq');
 --      ALTER TABLE audit_log ALTER COLUMN xid SET DEFAULT pg_current_xact_id();
 --

@@ -59,11 +59,17 @@
   "UPDATE job SET status = 'scheduled', modified_at = ?
     WHERE id = ANY(?)")
 
-;; Both sweeps are bulk UPDATEs that run before every dispatch batch, so
-;; they are the two queries where a missing tenant filter does the most
+;; The sweeps are bulk UPDATEs that run before every dispatch batch, so
+;; they are the queries where a missing tenant filter does the most
 ;; damage: without it any instance with a worker requeues another
 ;; instance's scheduled rows and, worse, aborts its running jobs once
 ;; their lease expires.
+
+;; A deduped job that already has a newer `new` row with its key cannot
+;; go back to `new`: that would put two rows in `job__new_dedupe__uniq`
+;; and abort the batch. `abort-superseded` resolves it; the guard in
+;; `reschedule-lost` covers the race with a submit that lands between the
+;; two statements.
 (def ^:private sql:reschedule-lost
   "UPDATE job
       SET status='new', scheduled_at=?::timestamptz
@@ -71,9 +77,36 @@
              FROM job AS t
             WHERE status = 'scheduled'
               AND t.tenant = ?
-              AND t.scheduled_at < ?::timestamptz - '5 min'::interval) AS subquery
+              AND t.scheduled_at < ?::timestamptz - '5 min'::interval
+              AND NOT (t.dedupe AND EXISTS (
+                    SELECT 1 FROM job AS d
+                     WHERE d.tenant = t.tenant
+                       AND d.name = t.name
+                       AND d.queue = t.queue
+                       AND d.label = t.label
+                       AND d.dedupe
+                       AND d.status = 'new'))) AS subquery
     WHERE job.id=subquery.id
 RETURNING job.id, job.name, job.queue")
+
+(def ^:private sql:abort-superseded
+  "UPDATE job
+      SET status='aborted', modified_at=?::timestamptz, error=?::jsonb
+     FROM (SELECT t.id
+             FROM job AS t
+            WHERE t.status = 'scheduled'
+              AND t.dedupe
+              AND t.tenant = ?
+              AND t.scheduled_at < ?::timestamptz - '5 min'::interval
+              AND EXISTS (SELECT 1 FROM job AS d
+                           WHERE d.tenant = t.tenant
+                             AND d.name = t.name
+                             AND d.queue = t.queue
+                             AND d.label = t.label
+                             AND d.dedupe
+                             AND d.status = 'new')) AS subquery
+    WHERE job.id=subquery.id
+RETURNING job.id, job.queue, job.name, job.created_at")
 
 (def ^:private sql:mark-orphan
   "UPDATE job
@@ -92,16 +125,43 @@ RETURNING job.id, job.queue, job.name, job.created_at")
 (def ^:private orphan-error-json
   (json/encode jobs/orphan-error))
 
+(def ^:private superseded-error-json
+  (json/encode jobs/superseded-error))
+
 (def ^:private aborted-outcome-json
   (json/encode {:outcome "aborted"}))
 
-(def ^:private sql:insert-orphan-events
+(def ^:private sql:insert-aborted-events
   "INSERT INTO job_event (job_id, kind, payload)
    SELECT unnest(?::uuid[]), 'end', ?::jsonb")
 
 (defn- encode-payload
   [{:keys [id scheduled-at]}]
   (json/encode [(str id) (ct/format-inst scheduled-at)]))
+
+(defn- abort-superseded-jobs
+  "Abort the deduped jobs whose message was lost and that already have a
+  newer `new` row with the same key. The newer row carries the latest
+  params, so it is the one that does the work; sending the lost one back
+  to `new` would put two rows in `job__new_dedupe__uniq` and abort the
+  batch. The abort owns its `end` events, like the orphan sweep."
+  [{:keys [::db/conn ::timestamp ::wrk/tenant] :as cfg}]
+  (let [rows (db/exec! conn [sql:abort-superseded timestamp superseded-error-json
+                             tenant timestamp]
+                       {:return-keys true})]
+    (when (seq rows)
+      (db/exec-one! conn [sql:insert-aborted-events
+                          (db/create-array conn "uuid" (map :id rows))
+                          aborted-outcome-json]))
+    (db/after-commit
+     (fn []
+       (doseq [{:keys [id queue name created-at]} rows]
+         (metrics/record-total cfg name :aborted
+                               (- (inst-ms timestamp) (inst-ms created-at)))
+         (l/wrn :hint "marked job as aborted (superseded by a newer submit)"
+                :id (str id)
+                :tenant tenant
+                :queue queue))))))
 
 (defn- reschedule-lost-jobs
   [{:keys [::db/conn ::timestamp ::wrk/tenant] :as cfg}]
@@ -130,7 +190,7 @@ RETURNING job.id, job.queue, job.name, job.created_at")
     ;; `aborted` outcome of `penpot_jobs_total_ms`, whose `_count` is the
     ;; orphan count.
     (when (seq rows)
-      (db/exec-one! conn [sql:insert-orphan-events
+      (db/exec-one! conn [sql:insert-aborted-events
                           (db/create-array conn "uuid" (map :id rows))
                           aborted-outcome-json]))
     (db/after-commit
@@ -178,6 +238,11 @@ RETURNING job.id, job.queue, job.name, job.created_at")
   [cfg]
   (let [cfg    (assoc cfg ::timestamp (ct/now))
         tpoint (ct/tpoint)]
+    ;; The lost deduped jobs that already have a newer pending row are
+    ;; aborted first: they cannot go back to `new` without breaking the
+    ;; dedupe index, and the newer row is the one that does the work.
+    (abort-superseded-jobs cfg)
+
     ;; Reschedule lost in transit jobs (can happen when
     ;; redis server is restarted just after job is pushed)
     (reschedule-lost-jobs cfg)

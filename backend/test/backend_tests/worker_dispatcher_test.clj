@@ -74,7 +74,7 @@
        (reduce + 0)))
 
 (defn- mk-job
-  [{:keys [name queue status scheduled-at modified-at tenant]
+  [{:keys [name queue status scheduled-at modified-at tenant dedupe label]
     :or   {name "test-job"
            queue "test"
            tenant (cf/get :tenant)
@@ -86,6 +86,8 @@
                          :name          name
                          :tenant        tenant
                          :queue         queue
+                         :label         label
+                         :dedupe        (boolean dedupe)
                          :params        (db/json {})
                          :priority      100
                          :max-retries   3
@@ -208,6 +210,62 @@
       (t/is (= 1.0 (counter-value metrics :jobs-rescheduled ["test-job"]))))
     (t/testing "the queue is not a label any more"
       (t/is (= 0.0 (counter-value metrics :jobs-rescheduled ["test"]))))))
+
+(t/deftest dispatcher-aborts-a-lost-dedupe-job-with-a-newer-submit
+  ;; A lost deduped job cannot go back to `new` when a newer submit already
+  ;; holds its key: two rows in `job__new_dedupe__uniq` abort the whole
+  ;; batch. The newer row carries the latest params, so the lost one is
+  ;; aborted with its end event instead.
+  (let [cfg   (assoc (mk-cfg) ::wdisp/timeout (ct/duration {:millis 0}))
+        lost  (mk-job {:status       "scheduled"
+                       :dedupe       true
+                       :label        "k"
+                       :scheduled-at (ct/minus (ct/now)
+                                               (ct/duration {:minutes 6}))})
+        fresh (mk-job {:status "new" :dedupe true :label "k"})]
+    (wdisp/run-batch cfg)
+    (let [row (get-row lost)]
+      (t/testing "the lost row is terminal, with the structured error"
+        (t/is (= "aborted" (:status row)))
+        (t/is (= jobs/superseded-error (:error row))))
+      (t/testing "the sweep stores the end event with the aborted outcome"
+        (t/is (= [{:kind "end" :payload {:outcome "aborted"}}]
+                 (:events row)))))
+    (t/testing "the newer submit does the work"
+      (t/is (= "scheduled" (:status (get-row fresh))))
+      (t/is (= 1 (count (drain-queue "test")))))))
+
+(t/deftest dispatcher-reschedules-a-lost-dedupe-job-without-a-submit
+  ;; Without a newer row the lost deduped job is the only one that can do
+  ;; the work: it goes back to `new` and is dispatched again, like any
+  ;; other lost job.
+  (let [cfg  (mk-cfg)
+        lost (mk-job {:status       "scheduled"
+                      :dedupe       true
+                      :label        "k"
+                      :scheduled-at (ct/minus (ct/now)
+                                              (ct/duration {:minutes 6}))})]
+    (wdisp/run-batch cfg)
+    (let [row (get-row lost)]
+      (t/is (= "scheduled" (:status row)))
+      (t/is (nil? (:error row)))
+      (t/is (> (inst-ms (:scheduled-at row))
+               (inst-ms (ct/minus (ct/now)
+                                  (ct/duration {:minutes 5})))))
+      (t/is (= 1 (count (drain-queue "test")))))))
+
+(t/deftest dispatcher-abort-superseded-records-the-terminal-counter
+  (let [metrics (make-orphan-metrics)
+        cfg     (assoc (mk-cfg) ::mtx/metrics metrics)]
+    (mk-job {:status       "scheduled"
+             :dedupe       true
+             :label        "k"
+             :scheduled-at (ct/minus (ct/now)
+                                     (ct/duration {:minutes 6}))})
+    (mk-job {:status "new" :dedupe true :label "k"})
+    (wdisp/run-batch cfg)
+    (t/testing "the superseded job counts as an aborted terminal outcome"
+      (t/is (= 1 (histogram-sample-count metrics ["test-job" "aborted"]))))))
 
 (t/deftest dispatcher-marks-stale-running-jobs-as-aborted-by-lease
   (let [cfg    (mk-cfg)

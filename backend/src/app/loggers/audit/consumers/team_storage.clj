@@ -33,9 +33,9 @@
   "Single source of the storage-usage contract: event name -> where its
   team ids live. `:paths` are the prop paths `team-ids-of-event` reads;
   `:keys` are the top-level props `carries-team-keys?` checks with
-  `contains?`, so an explicit empty collection counts as a fact and not
-  as a producer that lost its keys. Adding a name here also adds it to
-  `event-names`, so the two cannot drift."
+  `some?`, so an explicit empty collection counts as a fact and a nil
+  value as a producer that failed to resolve its team. Adding a name here
+  also adds it to `event-names`, so the two cannot drift."
   {"upload-file-media-object"          default-team-keys
    "create-file-media-object-from-url" default-team-keys
    "clone-file-media-object"           default-team-keys
@@ -109,11 +109,11 @@
 (defn- collect-team-ids
   "Team ids whose media storage may have changed in these events, read
   straight from props: producers key their events by team so the drain
-  never joins production tables. Each event name maps to its keys
-  explicitly; anything else falls back to the single :team-id in props.
-  A present non-UUID is a producer bug (see team-ids-of-event, never
-  coerced): that event is logged with its row id and skipped, so one bad
-  row cannot wedge the queue."
+  never joins production tables. The callers pass only events whose name
+  is in `event-names`; the `default-team-keys` fallback exists for a
+  direct call, not for the drain. A present non-UUID is a producer bug
+  (see team-ids-of-event, never coerced): that event is logged with its
+  row id and skipped, so one bad row cannot wedge the queue."
   [events]
   (into #{}
         (comp (map (fn [{:keys [id] :as event}]

@@ -103,7 +103,10 @@
   run: a missing position is treated as 0 until the consumer creates it
   on its first drain (at the end of the buffer). With no consumer
   enabled, nothing will read the buffer, so it is cleaned whole
-  (telemetry shadows excluded).
+  (telemetry shadows excluded): that branch is a safety net, not a
+  supported mode. The consumers are expected to exist (they will become
+  mandatory), and with none of them running the rows would only grow
+  until the disk fills.
 
   Returns the number of discarded rows; they count in the `discarded`
   metric with reason `gc`."

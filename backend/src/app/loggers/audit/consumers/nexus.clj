@@ -42,7 +42,9 @@
   "The Nexus endpoint of this consumer: the override on the cfg, or the one
   built from `:nexus-uri`. Raises when neither is available, at boot and on
   every pass, so a consumer without a destination fails loudly instead of
-  skipping silently."
+  skipping silently. Failing the boot is deliberate: a worker that starts
+  with its archive destination silently disabled is worse than one that
+  refuses to start."
   [cfg]
   (or (some-> (::uri cfg) u/uri)
       (generate-uri "api/audit")
@@ -125,7 +127,8 @@
 
 (defn- prepare
   "Resolve the destination once at boot: per-pass logs carry counts, this
-  says where the consumer sends."
+  says where the consumer sends. An incomplete configuration raises here
+  (see `resolve-uri`) and the worker does not start: intended."
   [cfg]
   (let [uri (resolve-uri cfg)]
     (l/dbg :hint "audit log consumer initialized"
