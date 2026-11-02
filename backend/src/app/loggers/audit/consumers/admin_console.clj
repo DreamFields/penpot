@@ -15,17 +15,17 @@
   destination.
 
   The allowlist lives here: it is this consumer's contract, not the
-  producer's (the producer only inserts rows). The mechanics (the
-  cursor, the lock, the GC) live in `app.loggers.audit.consumers`."
+  producer's (the producer only inserts rows). The component starts the
+  consumer loop at boot when its flag is on; the mechanics (the tick
+  mutex, the cursor, the frontier of the pass, the GC) live in
+  `app.loggers.audit.consumers`."
   (:require
    [app.common.exceptions :as ex]
    [app.common.logging :as l]
-   [app.common.schema :as sm]
    [app.common.uri :as u]
    [app.common.uuid :as uuid]
    [app.config :as cf]
    [app.db :as db]
-   [app.jobs :as jobs]
    [app.loggers.audit :as audit]
    [app.loggers.audit.consumers :as consumers]
    [app.metrics :as mtx]
@@ -270,42 +270,40 @@
                        :events (count decoded))]
     (send-to-admin-console cfg decoded)))
 
-(def schema:audit-log-consumer-admin-console-params
-  "Params of the admin-console job: none. Cron submits {}; system deps
-  (pool, admin-console client) live on the job-def cfg closed over by
-  the handler, not in job params. Closed on purpose, same as the nexus
-  schema."
-  [:map {:closed true}])
-
 (declare execute-audit-log-consumer-admin-console)
 
-(defmethod ig/assert-key ::job-def
+(defmethod ig/assert-key ::consumer
   [_ cfg]
   ;; No assert on the admin-console client: it inits to nil without the
-  ;; :admin-console flag, and the job skips on its flag anyway.
+  ;; :admin-console flag, and the component skips on its flag anyway.
   (assert (db/pool? (::db/pool cfg)) "expected a valid database pool")
   (assert (mtx/metrics? (::mtx/metrics cfg)) "expected a valid metrics instance"))
 
-(defmethod ig/init-key ::job-def
-  [_ cfg]
-  ;; Same as the nexus job-def: destination host once at boot. The
-  ;; ingest uri is resolved by nitrate/call at send time (it raises
-  ;; when missing); here it is display-only.
-  (l/dbg :hint "audit log consumer job initialized"
+(defn- prepare
+  "Destination host once at boot; the ingest uri is resolved by
+  nitrate/call at send time (it raises when missing)."
+  [cfg]
+  (l/dbg :hint "audit log consumer initialized"
          :consumer "admin-console"
          :uri-host (some-> (cf/get :admin-console-uri) u/uri u/get-domain))
-  {::jobs/name      :audit-log-consumer-admin-console
-   ::jobs/schema    schema:audit-log-consumer-admin-console-params
-   ::jobs/handler
-   (fn [_context params]
-     (execute-audit-log-consumer-admin-console cfg params))
-   ::jobs/decoder   (sm/decoder schema:audit-log-consumer-admin-console-params sm/json-transformer)
-   ::jobs/validator (sm/validator schema:audit-log-consumer-admin-console-params)})
+  cfg)
+
+(defmethod ig/init-key ::consumer
+  [_ cfg]
+  (consumers/init-consumer-component cfg
+                                     consumers/consumer-admin-console
+                                     prepare
+                                     execute-audit-log-consumer-admin-console))
+
+(defmethod ig/halt-key! ::consumer
+  [_ thread]
+  (consumers/halt-consumer-component thread))
 
 (defn execute-audit-log-consumer-admin-console
-  "Admin-console job handler: drain the stream from the admin-console
-  cursor in chunks (heartbeat per iteration: the batches can be long)."
-  [cfg _params]
-  (if-not (contains? cf/flags :admin-console)
-    (l/dbg :hint "audit log consumer (admin-console) skipped, flag off")
-    (consumers/drain-consumer cfg consumers/consumer-admin-console process-admin-console-chunk)))
+  "One pass of the admin-console consumer: drain the stream from its cursor
+  up to the frontier of the pass. The loop of `::consumer` calls it once
+  per pass; direct callers (REPL, tests) get the same behavior."
+  [cfg]
+  (consumers/drain-consumer cfg
+                            consumers/consumer-admin-console
+                            process-admin-console-chunk))

@@ -9,21 +9,20 @@
 
   It reads the whole stream from the Nexus cursor (the oldest events
   first) and POSTs them to Nexus in batches. A batch Nexus refuses rolls
-  back and stays for the next tick: the cursor does not advance, the job
-  aborts and the cron retries.
+  back and stays for the next pass: the cursor does not advance, the pass
+  aborts and the loop retries after its pause.
 
-  The mechanics (the cursor, the lock that keeps the events in order,
-  the GC) live in `app.loggers.audit.consumers`."
+  The component starts the consumer loop at boot when its flag is on. The
+  mechanics (the tick mutex, the cursor, the frontier of the pass, the GC)
+  live in `app.loggers.audit.consumers`."
   (:require
    [app.common.exceptions :as ex]
    [app.common.logging :as l]
-   [app.common.schema :as sm]
    [app.common.transit :as t]
    [app.common.uri :as u]
    [app.config :as cf]
    [app.db :as db]
    [app.http.client :as http]
-   [app.jobs :as jobs]
    [app.loggers.audit.consumers :as consumers]
    [app.metrics :as mtx]
    [app.setup :as-alias setup]
@@ -39,6 +38,18 @@
   (when-let [base (cf/get :nexus-uri)]
     (apply cf/join-uri base segments)))
 
+(defn- resolve-uri
+  "The Nexus endpoint of this consumer: the override on the cfg, or the one
+  built from `:nexus-uri`. Raises when neither is available, at boot and on
+  every pass, so a consumer without a destination fails loudly instead of
+  skipping silently."
+  [cfg]
+  (or (some-> (::uri cfg) u/uri)
+      (generate-nexus-uri "api/audit")
+      (ex/raise :type :internal
+                :code :task-not-configured
+                :hint "consumer task not configured, missing uri")))
+
 (defn- truncate-body
   [body limit]
   (when (some? body)
@@ -51,7 +62,7 @@
   "POST events to Nexus. Returns the number of events sent; throws on
   transport failure or non-204 refusal, carrying the attempted count
   as :events in the error data so the caller records the failure.
-  No metrics or logs here: the runner reports the aborted job."
+  No metrics or logs here: the loop reports the aborted pass."
   [{:keys [::uri] :as cfg} events]
   (let [n      (count events)
         skey   (-> cfg ::setup/shared-keys :nexus)
@@ -88,7 +99,7 @@
   [cfg rows]
   (let [events (mapv (comp consumers/row->event consumers/decode-row) rows)
         ;; send-to-nexus returns the count or throws: a refusal
-        ;; aborts the job, the rows stay for the next tick.
+        ;; aborts the pass, the rows stay for the next one.
         n      (send-to-nexus cfg events)]
 
     (l/trc :hint "consumer events chunk"
@@ -97,54 +108,40 @@
 
     {:processed n :skipped 0}))
 
-(def schema:audit-log-consumer-nexus-params
-  "Overrides for the nexus job repl invocation defaults.
-  Cron submits {}; system deps (pool, shared-keys, http) live on the
-  job-def cfg closed over by the handler, not in job params.
-  Closed on purpose: a stale key (like the old :enabled) must fail
-  validation loudly instead of skipping silently."
-  [:map {:closed true}
-   [:uri {:optional true} ::sm/uri]])
-
 (declare execute-audit-log-consumer-nexus)
 
-(defmethod ig/assert-key ::job-def
+(defmethod ig/assert-key ::consumer
   [_ cfg]
   (assert (db/pool? (::db/pool cfg)) "expected a valid database pool")
   (assert (http/client? (::http/client cfg)) "expected a valid http client")
   (assert (mtx/metrics? (::mtx/metrics cfg)) "expected a valid metrics instance"))
 
-(defmethod ig/init-key ::job-def
+(defn- prepare
+  "Resolve the destination once at boot: per-pass logs carry counts, this
+  says where the consumer sends."
+  [cfg]
+  (let [uri (resolve-uri cfg)]
+    (l/dbg :hint "audit log consumer initialized"
+           :consumer "nexus"
+           :uri-host (u/get-domain uri))
+    (assoc cfg ::uri uri)))
+
+(defmethod ig/init-key ::consumer
   [_ cfg]
-  ;; Effective destination, once at boot: per-run logs carry counts,
-  ;; the runner says the job started, this says where it sends.
-  (l/dbg :hint "audit log consumer job initialized"
-         :consumer "nexus"
-         :uri-host (some-> (cf/get :nexus-uri) u/uri u/get-domain))
-  {::jobs/name      :audit-log-consumer-nexus
-   ::jobs/schema    schema:audit-log-consumer-nexus-params
-   ::jobs/handler
-   (fn [_context params]
-     (execute-audit-log-consumer-nexus cfg params))
-   ::jobs/decoder   (sm/decoder schema:audit-log-consumer-nexus-params sm/json-transformer)
-   ::jobs/validator (sm/validator schema:audit-log-consumer-nexus-params)})
+  (consumers/init-consumer-component cfg
+                                     consumers/consumer-nexus
+                                     prepare
+                                     execute-audit-log-consumer-nexus))
+
+(defmethod ig/halt-key! ::consumer
+  [_ thread]
+  (consumers/halt-consumer-component thread))
 
 (defn execute-audit-log-consumer-nexus
-  "Nexus job handler: drain the stream from the Nexus cursor in chunks,
-  then clean up (heartbeat per iteration: the sent chunk batches can be
-  long)."
-  [cfg params]
-  ;; NOTE: this let allows overwrite default configured values from
-  ;; the repl, when manually invoking the task.
-  (if-not (contains? cf/flags :nexus)
-    (l/dbg :hint "audit log consumer (nexus) skipped, flag off")
-    (let [uri (or (:uri params) (generate-nexus-uri "api/audit"))
-          ;; Normalize to an uri object; params may carry a plain string
-          ;; on direct invocations (validation only applies on submit!).
-          uri (u/uri uri)
-          cfg (assoc cfg ::uri uri)]
-      (when-not uri
-        (ex/raise :type :internal
-                  :code :task-not-configured
-                  :hint "consumer task not configured, missing uri"))
-      (consumers/drain-consumer cfg consumers/consumer-nexus process-nexus-chunk))))
+  "One pass of the Nexus consumer: drain the stream from its cursor up to
+  the frontier of the pass. The loop of `::consumer` calls it once per
+  pass; direct callers (REPL, tests) get the same behavior."
+  [cfg]
+  (consumers/drain-consumer (assoc cfg ::uri (resolve-uri cfg))
+                            consumers/consumer-nexus
+                            process-nexus-chunk))

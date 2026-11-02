@@ -21,8 +21,8 @@
 -- `<tenant>:<queue>` prefix could only be matched with a LIKE over text. Every
 -- query that acts on one instance's work (dispatch, orphan sweep, reschedule,
 -- cron no-overlap check) filters on `tenant` for that reason, and the tenant
--- leads the keys of the submit dedupe and exclusivity indexes (see 0159 and
--- 0162).
+-- leads the keys of the submit dedupe and exclusivity indexes (see the
+-- consumer-generalization migration).
 -- The prefix still exists, but only in the Redis key the queue's payloads
 -- travel through, composed in one place by `app.worker/queue-key`.
 --
@@ -89,7 +89,7 @@ CREATE INDEX job__profile__idx
 -- Cron no-overlap check: it looks for the jobs of one tenant with the same
 -- name, queue and label that have not started yet. The dedupe of the submit
 -- does not read it: that one is the unique index over the not-started dedupe
--- jobs (see 0162).
+-- jobs (see the consumer-generalization migration).
 CREATE INDEX job__name_label__idx
     ON job (tenant, name, queue, label)
     WHERE status IN ('new', 'scheduled', 'running', 'retry');

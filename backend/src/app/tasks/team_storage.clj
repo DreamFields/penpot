@@ -10,19 +10,18 @@
   reads instead of scanning `storage_object` on every upload.
 
   The team-storage consumer of the audit log marks dirty the teams whose
-  media may have changed: it reads the stream from its own cursor, takes
-  the storage-usage event names and marks their teams in one write per
-  chunk. Every few minutes the `:schedule-team-storage` scheduler streams
-  all dirty teams oldest-first and enqueues one `:recompute-team-storage`
-  job per team (skipped while one is already live), so a failure is
-  contained in its own job and the next tick reschedules it. Teams
-  without a row are born on first quota check (fail open + dirty), never
-  swept."
+  media may have changed: a loop in its own thread reads the stream from
+  its cursor, takes the storage-usage event names and marks their teams
+  in one write per chunk. Every few minutes the `:schedule-team-storage`
+  scheduler streams all dirty teams oldest-first and enqueues one
+  `:recompute-team-storage` job per team (skipped while one is already
+  live), so a failure is contained in its own job and the next tick
+  reschedules it. Teams without a row are born on first quota check (fail
+  open + dirty), never swept."
   (:require
    [app.common.exceptions :as ex]
    [app.common.logging :as l]
    [app.common.schema :as sm]
-   [app.config :as cf]
    [app.db :as db]
    [app.jobs :as jobs]
    [app.loggers.audit :as audit]
@@ -32,7 +31,7 @@
    [integrant.core :as ig]))
 
 ;; The consumer ids live in `app.loggers.audit.consumers`; this domain
-;; owns the processing of its own events and the job that runs it.
+;; owns the processing of its own events and the loop that runs it.
 
 (def ^:private sql:get-dirty-teams
   "Dirty teams first, then the ones nobody refreshed for a week. The
@@ -215,40 +214,38 @@
     {:processed (count events)
      :skipped   (- total (count events))}))
 
-(def schema:audit-log-consumer-team-storage-params
-  "Params of the team-storage consumer job: none. Cron submits {}; the
-  pool and the metrics live on the job-def cfg closed over by the
-  handler, not in job params (closed on purpose, same as the other
-  transports)."
-  [:map {:closed true}])
-
 (declare execute-audit-log-consumer-team-storage)
 
-(defmethod ig/assert-key ::consumer-job-def
+(defmethod ig/assert-key ::consumer
   [_ cfg]
   (assert (db/pool? (::db/pool cfg)) "expected a valid database pool")
   (assert (mtx/metrics? (::mtx/metrics cfg)) "expected a valid metrics instance"))
 
-(defmethod ig/init-key ::consumer-job-def
+(defn- prepare
+  [cfg]
+  (l/dbg :hint "audit log consumer initialized" :consumer "team-storage")
+  cfg)
+
+(defmethod ig/init-key ::consumer
   [_ cfg]
-  (l/dbg :hint "audit log consumer job initialized"
-         :consumer "team-storage")
-  {::jobs/name      :audit-log-consumer-team-storage
-   ::jobs/schema    schema:audit-log-consumer-team-storage-params
-   ::jobs/handler
-   (fn [_context _params]
-     (execute-audit-log-consumer-team-storage cfg))
-   ::jobs/decoder   (sm/decoder schema:audit-log-consumer-team-storage-params sm/json-transformer)
-   ::jobs/validator (sm/validator schema:audit-log-consumer-team-storage-params)})
+  (consumers/init-consumer-component cfg
+                                     consumers/consumer-team-storage
+                                     prepare
+                                     execute-audit-log-consumer-team-storage))
+
+(defmethod ig/halt-key! ::consumer
+  [_ thread]
+  (consumers/halt-consumer-component thread))
 
 (defn execute-audit-log-consumer-team-storage
-  "Team-storage job handler: read the stream from the team-storage
-  cursor in chunks and mark the teams of the storage-usage events dirty
-  (heartbeat per iteration: a burst can span many chunks)."
+  "One pass of the team-storage consumer: read the stream from its cursor
+  up to the frontier of the pass and mark the teams of the storage-usage
+  events dirty. The loop of `::consumer` calls it once per pass; direct
+  callers (REPL, tests) get the same behavior."
   [cfg]
-  (if-not (contains? cf/flags :storage-usage)
-    (l/dbg :hint "audit log consumer (team-storage) skipped, flag off")
-    (consumers/drain-consumer cfg consumers/consumer-team-storage process-team-storage-chunk)))
+  (consumers/drain-consumer cfg
+                            consumers/consumer-team-storage
+                            process-team-storage-chunk))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; RECOMPUTE

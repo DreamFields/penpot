@@ -10,7 +10,6 @@
   and the GC of the buffer."
   (:require
    [app.common.json :as json]
-   [app.common.schema :as sm]
    [app.common.time :as ct]
    [app.common.transit :as transit]
    [app.common.uri :as u]
@@ -33,7 +32,8 @@
    [clojure.test :as t]
    [cuerdas.core :as str]
    [integrant.core :as ig]
-   [mockery.core :refer [with-mocks]])
+   [mockery.core :refer [with-mocks]]
+   [promesa.exec :as px])
   (:import
    io.prometheus.client.Counter
    io.prometheus.client.Counter$Child
@@ -98,13 +98,31 @@
                    :tracked-at (ct/now)
                    :created-at (ct/now)})))
 
+(defn- nexus-cfg
+  ([uri] (nexus-cfg uri (:app.metrics/metrics th/*system*)))
+  ([uri metrics]
+   (cond-> {::db/pool           (:app.db/pool th/*system*)
+            ::setup/shared-keys {:admin-console "ac-key" :nexus "nexus-key"}
+            ::http/client       (:app.http.client/client th/*system*)
+            ::mtx/metrics       metrics}
+     uri (assoc ::consumer.nexus/uri uri))))
+
 (defn- run-nexus
-  [params]
-  (th/run-task! :audit-log-consumer-nexus params))
+  ([] (run-nexus {}))
+  ([params]
+   (consumer.nexus/execute-audit-log-consumer-nexus
+    (nexus-cfg (:uri params)))))
+
+(defn- admin-console-cfg
+  [metrics]
+  {::db/pool           (:app.db/pool th/*system*)
+   :app.nitrate/client (:app.nitrate/client th/*system*)
+   ::mtx/metrics       metrics})
 
 (defn- run-admin-console
   []
-  (th/run-task! :audit-log-consumer-admin-console {}))
+  (consumer.admin-console/execute-audit-log-consumer-admin-console
+   (admin-console-cfg (:app.metrics/metrics th/*system*))))
 
 (defn- run-gc
   []
@@ -182,14 +200,37 @@
         (run-nexus {})
         (t/is (= ["http://nexus.example/api/audit"] @uris))))))
 
-(t/deftest consumer-nexus-job-requires-uri-when-nexus-flag-set
+(t/deftest consumer-nexus-component-requires-uri-when-flag-set
   (with-redefs [cf/flags #{:nexus}
                 cf/config (dissoc cf/config :nexus-uri)]
     (let [data (ex-data (try
-                          (run-nexus {})
+                          (ig/init-key :app.loggers.audit.consumers.nexus/consumer
+                                       (nexus-cfg nil))
                           (catch Throwable cause
                             cause)))]
       (t/is (= :task-not-configured (:code data))))))
+
+(t/deftest consumer-nexus-component-does-not-start-with-the-flag-off
+  (with-redefs [cf/flags #{}]
+    (t/is (nil? (ig/init-key :app.loggers.audit.consumers.nexus/consumer
+                             (nexus-cfg archive-uri))))))
+
+(t/deftest consumer-nexus-component-drains-and-stops
+  (let [prof (th/create-profile* 4 {:is-active true})]
+    (with-redefs-fn {#'cf/flags #{:nexus}
+                     #'consumer/sleep-ms 10}
+      (fn []
+        (with-mocks [http-mock {:target 'app.http.client/req :return {:status 204}}]
+          (insert-audit-row (:id prof) "create-project")
+          (let [thread (ig/init-key :app.loggers.audit.consumers.nexus/consumer
+                                    (nexus-cfg archive-uri))]
+            (try
+              (t/is (th/wait-for #(zero? (unread-count consumer/consumer-nexus))))
+              (t/is (:called? @http-mock))
+              (finally
+                (ig/halt-key! :app.loggers.audit.consumers.nexus/consumer thread)))
+            (.join ^Thread thread 5000)
+            (t/is (false? (.isAlive ^Thread thread)))))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; ADMIN CONSOLE: ITS ALLOWLIST, ITS OWN FILTER
@@ -238,6 +279,28 @@
         (t/is (= 0 (unread-count consumer/consumer-nexus)))
         (t/is (= 1 (unread-count consumer/consumer-admin-console)))))))
 
+(t/deftest consumer-admin-console-component-does-not-start-with-the-flag-off
+  (with-redefs [cf/flags #{}]
+    (t/is (nil? (ig/init-key :app.loggers.audit.consumers.admin-console/consumer
+                             (admin-console-cfg (:app.metrics/metrics th/*system*)))))))
+
+(t/deftest consumer-admin-console-component-drains-and-stops
+  (let [prof (th/create-profile* 14 {:is-active true})]
+    (with-redefs-fn {#'cf/flags #{:admin-console}
+                     #'consumer/sleep-ms 10}
+      (fn []
+        (with-mocks [admin-console-mock {:target 'app.nitrate/call :return nil}]
+          (insert-audit-row (:id prof) "create-project")
+          (let [thread (ig/init-key :app.loggers.audit.consumers.admin-console/consumer
+                                    (admin-console-cfg (:app.metrics/metrics th/*system*)))]
+            (try
+              (t/is (th/wait-for #(zero? (unread-count consumer/consumer-admin-console))))
+              (t/is (:called? @admin-console-mock))
+              (finally
+                (ig/halt-key! :app.loggers.audit.consumers.admin-console/consumer thread)))
+            (.join ^Thread thread 5000)
+            (t/is (false? (.isAlive ^Thread thread)))))))))
+
 (t/deftest consumer-admin-console-encodes-db-rows-for-admin-console
   (let [prof (th/create-profile* 13 {:is-active true})]
     (with-redefs [cf/flags  #{:admin-console}
@@ -250,10 +313,9 @@
             client         (ig/init-key :app.nitrate/client
                                         {::http/client       (Object.)
                                          ::setup/shared-keys shared-keys})
-            admin-console-job-def (ig/init-key :app.loggers.audit.consumers.admin-console/job-def
-                                               {::db/pool           (:app.db/pool th/*system*)
-                                                ::mtx/metrics       (th/metrics-stub)
-                                                :app.nitrate/client client})]
+            consumer-cfg   {::db/pool           (:app.db/pool th/*system*)
+                            ::mtx/metrics       (th/metrics-stub)
+                            :app.nitrate/client client}]
         (with-mocks [http-mock {:target 'app.http.client/req
                                 :return
                                 (fn [_ req & _]
@@ -263,7 +325,7 @@
           (let [team-id (uuid/next)
                 row     (insert-audit-row (:id prof) "create-project"
                                           {:team-id team-id})]
-            ((::jobs/handler admin-console-job-def) nil {})
+            (consumer.admin-console/execute-audit-log-consumer-admin-console consumer-cfg)
             (t/is (= 1 (count @admin-console-bodies)))
             (let [body  (json/decode (first @admin-console-bodies) :key-fn json/read-kebab-key)
                   event (first (:events body))]
@@ -464,23 +526,6 @@
           (t/is (= (:id team) (:team-id props)))
           (t/is (= (:name team) (:team-name props))))))))
 
-(t/deftest consumer-params-accept-empty-cron-props
-  ;; Cron always submits (or props {}) — system deps live on the
-  ;; job-def cfg, not in params. Requiring them here blocks every tick.
-  ;; The schemas are closed: a stale manual invocation must fail
-  ;; validation loudly instead of skipping silently.
-  (let [nexus-valid?          (sm/validator consumer.nexus/schema:audit-log-consumer-nexus-params)
-        admin-console-valid?  (sm/validator consumer.admin-console/schema:audit-log-consumer-admin-console-params)
-        team-storage-valid?   (sm/validator team-storage/schema:audit-log-consumer-team-storage-params)]
-    (t/is (true? (nexus-valid? {})))
-    (t/is (false? (nexus-valid? {:enabled true})))
-    (t/is (true? (nexus-valid? {:uri (u/uri archive-uri)})))
-    (t/is (true? (admin-console-valid? {})))
-    (t/is (false? (admin-console-valid? {:enabled true})))
-    (t/is (false? (admin-console-valid? {:uri (u/uri archive-uri)})))
-    (t/is (true? (team-storage-valid? {})))
-    (t/is (false? (team-storage-valid? {:enabled true})))))
-
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; THE SNAPSHOT CUT: A ROW OF AN OPEN TRANSACTION IS NEVER SKIPPED
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -554,15 +599,210 @@
           (t/is (= 0 (unread-count consumer/consumer-nexus))))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; THE TICK: ONE PASS ACROSS INSTANCES, WITH A FRONTIER
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defn- sent-event-names
+  "The event names of every batch the http mock received, in order."
+  [http-mock]
+  (->> (:call-args-list @http-mock)
+       (mapcat (comp :events transit/decode :body second))
+       (mapv :name)))
+
+(defn- hold-tick
+  "Take the tick lock of a consumer on a connection, as another instance
+  would, answering the [classid objid] pair the caller releases with."
+  [conn consumer-id]
+  (let [[classid objid] (#'consumer/tick-lock-key consumer-id)]
+    (assert (true? (db/session-try-lock conn classid objid)))
+    [classid objid]))
+
+(defn- release-tick
+  [conn [classid objid]]
+  (db/session-unlock conn classid objid))
+
+(t/deftest consumer-tick-skips-when-another-instance-holds-it
+  (let [prof (th/create-profile* 33 {:is-active true})]
+    (with-redefs [cf/flags #{:nexus}]
+      (with-mocks [http-mock {:target 'app.http.client/req :return {:status 204}}]
+        (insert-audit-row (:id prof) "create-project")
+        (with-open [conn (db/open th/*system*)]
+          (let [tick (hold-tick conn consumer/consumer-nexus)]
+            ;; Another instance is draining: this pass does nothing.
+            (t/is (= ::consumer/busy (run-nexus {:uri archive-uri})))
+            (t/is (false? (:called? @http-mock)))
+            (t/is (= 0 (:seq (cursor-of consumer/consumer-nexus))))
+            (t/is (true? (release-tick conn tick)))))
+        ;; With the tick free, the same pass drains.
+        (run-nexus {:uri archive-uri})
+        (t/is (:called? @http-mock))
+        (t/is (= 0 (unread-count consumer/consumer-nexus)))))))
+
+(t/deftest consumer-tick-busy-records-only-the-pass-counter
+  (let [prof     (th/create-profile* 34 {:is-active true})
+        recorded (atom [])]
+    (with-redefs [cf/flags #{:nexus}
+                  consumer/record-count (fn [_ id labels amount]
+                                          (swap! recorded conj [id labels amount]))]
+      (with-mocks [http-mock {:target 'app.http.client/req :return {:status 204}}]
+        (insert-audit-row (:id prof) "create-project")
+        (with-open [conn (db/open th/*system*)]
+          (let [tick (hold-tick conn consumer/consumer-nexus)]
+            (t/is (= ::consumer/busy (run-nexus {:uri archive-uri})))
+            (release-tick conn tick)))
+        (t/is (= [[:audit-consumer-passes ["nexus" "busy"] 1]] @recorded))
+        (t/is (false? (:called? @http-mock)))))))
+
+(t/deftest consumer-tick-never-collides-with-a-file-lock
+  ;; `update-file` takes a one-key advisory lock from the hash of the file
+  ;; id; the consumers take a two-key one, a different lock space, so a
+  ;; file lock with the same numbers cannot block a pass.
+  (let [prof (th/create-profile* 36 {:is-active true})
+        [classid objid] (#'consumer/tick-lock-key consumer/consumer-nexus)
+        bigint-key (+ (* (long classid) 4294967296) objid)]
+    (with-redefs [cf/flags #{:nexus}]
+      (with-mocks [http-mock {:target 'app.http.client/req :return {:status 204}}]
+        (insert-audit-row (:id prof) "create-project")
+        (with-open [conn (db/open th/*system*)]
+          (t/is (true? (:lock (db/exec-one! conn
+                                            ["select pg_try_advisory_lock(?::bigint) as lock"
+                                             bigint-key]))))
+          (t/is (not= ::consumer/busy (run-nexus {:uri archive-uri})))
+          (t/is (:called? @http-mock))
+          (db/exec-one! conn ["select pg_advisory_unlock(?::bigint)" bigint-key]))))))
+
+(defn- make-pool
+  "A dedicated pool, to pin how many connections a pass needs."
+  ([max-size] (make-pool max-size {}))
+  ([max-size extra]
+   (ig/init-key :app.db/pool
+                (merge {::db/uri      (:database-uri th/config)
+                        ::db/username (:database-username th/config)
+                        ::db/password (:database-password th/config)
+                        ::db/max-size max-size
+                        ::db/name     :test-consumers
+                        ::mtx/metrics (ig/init-key :app.metrics/metrics {:default {}})}
+                       extra))))
+
+(defn- run-nexus-on
+  "Run one nexus pass merging `overrides` over the test cfg."
+  [overrides]
+  (consumer.nexus/execute-audit-log-consumer-nexus
+   (merge (nexus-cfg archive-uri) overrides)))
+
+(t/deftest consumer-pass-needs-one-connection
+  ;; The frontier, every chunk transaction and the lag gauge run on the
+  ;; connection that holds the tick: a pool of one is enough.
+  (let [prof (th/create-profile* 37 {:is-active true})
+        pool (make-pool 1)]
+    (try
+      (with-redefs [cf/flags #{:nexus}]
+        (with-mocks [http-mock {:target 'app.http.client/req :return {:status 204}}]
+          (with-open [conn (db/open th/*system*)]
+            (insert-rows-in-one-transaction conn "lote-" 300)
+            (db/exec! conn ["COMMIT"]))
+          (run-nexus-on {::db/pool pool})
+          (let [bodies (map #(transit/decode (:body (second %)))
+                            (:call-args-list @http-mock))]
+            (t/is (= [128 128 44] (mapv #(count (:events %)) bodies))))
+          (t/is (= 0 (unread-count consumer/consumer-nexus)))))
+      (finally
+        (ig/halt-key! :app.db/pool pool)))))
+
+(t/deftest consumer-pass-clears-a-stale-tick-on-the-borrowed-connection
+  ;; A pass that could not release the tick leaves it on its pooled
+  ;; connection; the next pass borrows that connection, clears whatever it
+  ;; carries and drains.
+  (let [prof (th/create-profile* 38 {:is-active true})
+        pool (make-pool 1)]
+    (try
+      (with-redefs [cf/flags #{:nexus}]
+        (with-mocks [http-mock {:target 'app.http.client/req :return {:status 204}}]
+          (insert-audit-row (:id prof) "create-project")
+          (with-open [conn (db/open pool)]
+            (let [[classid objid] (#'consumer/tick-lock-key consumer/consumer-nexus)]
+              (t/is (true? (db/session-try-lock conn classid objid)))))
+          (run-nexus-on {::db/pool pool})
+          (t/is (:called? @http-mock))
+          (t/is (= 0 (unread-count consumer/consumer-nexus)))))
+      (finally
+        (ig/halt-key! :app.db/pool pool)))))
+
+(t/deftest consumer-pass-stops-at-the-watermark
+  ;; A pass drains up to the newest row that existed when it started: a
+  ;; row committed while the pass runs is left for the next one, so the
+  ;; pass ends instead of chasing a tail of tiny chunks for ever.
+  (let [prof    (th/create-profile* 35 {:is-active true})
+        arrived (atom 0)]
+    (with-redefs [cf/flags #{:nexus}]
+      (with-mocks [http-mock {:target 'app.http.client/req
+                              :return (fn [_ _ & _]
+                                        (when (= 1 (swap! arrived inc))
+                                          (insert-audit-row (:id prof) "mid-pass"))
+                                        {:status 204})}]
+        (insert-audit-row (:id prof) "before-1")
+        (insert-audit-row (:id prof) "before-2")
+        (run-nexus {:uri archive-uri})
+        (t/is (= 1 (:call-count @http-mock)))
+        (t/is (= ["before-1" "before-2"] (sent-event-names http-mock)))
+        ;; The row of the pass in course waits for the next one.
+        (t/is (= 1 (unread-count consumer/consumer-nexus)))
+        (run-nexus {:uri archive-uri})
+        (t/is (= 2 (:call-count @http-mock)))
+        (t/is (= ["before-1" "before-2" "mid-pass"] (sent-event-names http-mock)))
+        (t/is (= 0 (unread-count consumer/consumer-nexus)))))))
+
+(t/deftest consumer-loop-runs-passes-until-interrupted
+  (let [passes (atom 0)]
+    (with-redefs-fn {#'consumer/sleep-ms 10}
+      (fn []
+        (let [thread (consumer/start-consumer-loop
+                      {}
+                      consumer/consumer-nexus
+                      (fn [_] (swap! passes inc)))]
+          (try
+            (loop [i 0]
+              (when (and (< @passes 3) (< i 300))
+                (Thread/sleep 5)
+                (recur (inc i))))
+            (t/is (<= 3 @passes))
+            (finally
+              (px/interrupt! thread)))
+          (.join ^Thread thread 5000)
+          (t/is (false? (.isAlive ^Thread thread))))))))
+
+(t/deftest consumer-loop-survives-a-failing-pass
+  (let [passes (atom 0)]
+    (with-redefs-fn {#'consumer/sleep-ms 10}
+      (fn []
+        (let [thread (consumer/start-consumer-loop
+                      {}
+                      consumer/consumer-nexus
+                      (fn [_]
+                        (swap! passes inc)
+                        (throw (ex-info "boom" {}))))]
+          (try
+            (loop [i 0]
+              (when (and (< @passes 3) (< i 300))
+                (Thread/sleep 5)
+                (recur (inc i))))
+            (t/is (<= 3 @passes))
+            (finally
+              (px/interrupt! thread)))
+          (.join ^Thread thread 5000)
+          (t/is (false? (.isAlive ^Thread thread))))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; METRICS
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;; The job-def cfg of these tests carries an isolated metrics registry
+;; The pass cfg of these tests carries an isolated metrics registry
 ;; (pattern from `jobs-metrics-test`), so assertions read exact values
 ;; instead of the shared test-system registry. `th/run-task!` would use
 ;; the latter and its counts would leak across tests.
 (def ^:private consumer-metric-ids
-  [:audit-consumer-events :audit-consumer-discarded :audit-consumer-lag])
+  [:audit-consumer-events :audit-consumer-discarded :audit-consumer-lag
+   :audit-consumer-passes])
 
 (defn- make-consumer-metrics
   []
@@ -570,26 +810,17 @@
                {:default (select-keys main/default-metrics consumer-metric-ids)}))
 
 (defn- invoke-nexus
-  "Invoke the nexus consumer handler in-process with an isolated
-  metrics registry. The handler takes a nil context because there is
-  no job row to describe (same as `th/run-task!`)."
+  "Run one nexus pass with an isolated metrics registry, so assertions
+  read exact values instead of the shared test-system registry."
   [metrics params]
-  (let [job-def (ig/init-key :app.loggers.audit.consumers.nexus/job-def
-                             {::db/pool           (:app.db/pool th/*system*)
-                              ::setup/shared-keys {:admin-console "ac-key" :nexus "nexus-key"}
-                              ::http/client       (:app.http.client/client th/*system*)
-                              ::mtx/metrics       metrics})]
-    ((::jobs/handler job-def) nil params)))
+  (consumer.nexus/execute-audit-log-consumer-nexus
+   (nexus-cfg (:uri params) metrics)))
 
 (defn- invoke-admin-console
-  "Invoke the admin-console consumer handler in-process with an
-  isolated metrics registry."
+  "Run one admin-console pass with an isolated metrics registry."
   [metrics]
-  (let [job-def (ig/init-key :app.loggers.audit.consumers.admin-console/job-def
-                             {::db/pool           (:app.db/pool th/*system*)
-                              :app.nitrate/client (:app.nitrate/client th/*system*)
-                              ::mtx/metrics       metrics})]
-    ((::jobs/handler job-def) nil {})))
+  (consumer.admin-console/execute-audit-log-consumer-admin-console
+   (admin-console-cfg metrics)))
 
 (defn- invoke-both
   "Invoke both consumer handlers sharing one isolated metrics
@@ -612,6 +843,15 @@
         child     (.labels ^Gauge instance (into-array String labels))]
     (.get ^Gauge$Child child)))
 
+(t/deftest consumer-empty-pass-records-lag-zero
+  (let [metrics (make-consumer-metrics)]
+    (with-redefs [cf/flags #{:nexus}]
+      (with-mocks [http-mock {:target 'app.http.client/req :return {:status 204}}]
+        ;; No rows: the pass finds no frontier and sends nothing.
+        (invoke-nexus metrics {:uri archive-uri})
+        (t/is (false? (:called? @http-mock)))
+        (t/is (zero? (gauge-value metrics :audit-consumer-lag ["nexus"])))))))
+
 (t/deftest consumer-records-metrics-on-success
   (let [prof    (th/create-profile* 40 {:is-active true})
         metrics (make-consumer-metrics)]
@@ -629,13 +869,130 @@
 
 (t/deftest consumer-records-the-lag-gauge
   (let [prof    (th/create-profile* 41 {:is-active true})
-        metrics (make-consumer-metrics)
-        cfg     {::db/pool (:app.db/pool th/*system*) ::mtx/metrics metrics}]
+        metrics (make-consumer-metrics)]
     (insert-audit-row (:id prof) "create-project")
     (insert-audit-row (:id prof) "create-file")
     ;; The cursor is still at zero: two confirmed events behind.
-    (#'consumer/record-lag cfg {:id consumer/consumer-nexus})
+    (with-open [conn (db/open th/*system*)]
+      (#'consumer/record-lag conn metrics {:id consumer/consumer-nexus}))
     (t/is (= 2.0 (gauge-value metrics :audit-consumer-lag ["nexus"])))))
+
+(t/deftest consumer-pass-counter-records-ok-and-busy
+  (let [prof    (th/create-profile* 39 {:is-active true})
+        metrics (make-consumer-metrics)]
+    (with-redefs [cf/flags #{:nexus}]
+      (with-mocks [http-mock {:target 'app.http.client/req :return {:status 204}}]
+        (insert-audit-row (:id prof) "create-project")
+        (invoke-nexus metrics {:uri archive-uri})
+        (t/is (= 1.0 (counter-value metrics :audit-consumer-passes ["nexus" "ok"])))
+
+        (insert-audit-row (:id prof) "create-file")
+        (with-open [conn (db/open th/*system*)]
+          (let [tick (hold-tick conn consumer/consumer-nexus)]
+            (t/is (= ::consumer/busy (invoke-nexus metrics {:uri archive-uri})))
+            (release-tick conn tick)))
+        (t/is (= 1.0 (counter-value metrics :audit-consumer-passes ["nexus" "busy"])))
+        (t/is (= 1.0 (counter-value metrics :audit-consumer-passes ["nexus" "ok"])))))))
+
+(t/deftest consumer-pass-counter-records-a-failure-and-releases-the-tick
+  (let [prof    (th/create-profile* 40 {:is-active true})
+        metrics (make-consumer-metrics)
+        calls   (atom 0)]
+    (with-redefs [cf/flags #{:nexus}]
+      (with-mocks [http-mock {:target 'app.http.client/req
+                              :return (fn [_ _ & _]
+                                        (if (= 1 (swap! calls inc))
+                                          (throw (ex-info "timeout" {}))
+                                          {:status 204}))}]
+        (insert-audit-row (:id prof) "create-project")
+        (t/is (thrown? clojure.lang.ExceptionInfo
+                       (invoke-nexus metrics {:uri archive-uri})))
+        (t/is (= 1.0 (counter-value metrics :audit-consumer-passes ["nexus" "failed"])))
+        ;; The tick was released: the next pass drains and counts ok.
+        (invoke-nexus metrics {:uri archive-uri})
+        (t/is (= 1.0 (counter-value metrics :audit-consumer-passes ["nexus" "ok"])))
+        (t/is (= 0 (unread-count consumer/consumer-nexus)))))))
+
+(t/deftest consumer-pass-reports-the-chunks-that-committed-before-a-failure
+  ;; A refusal on the second chunk must not hide the 128 events of the
+  ;; first: its transaction committed and the cursor moved past it.
+  (let [prof    (th/create-profile* 43 {:is-active true})
+        metrics (make-consumer-metrics)
+        calls   (atom 0)]
+    (with-redefs [cf/flags #{:nexus}]
+      (with-mocks [http-mock {:target 'app.http.client/req
+                              :return (fn [_ _ & _]
+                                        (if (= 2 (swap! calls inc))
+                                          (throw (ex-info "timeout" {}))
+                                          {:status 204}))}]
+        (with-open [conn (db/open th/*system*)]
+          (insert-rows-in-one-transaction conn "lote-" 300)
+          (db/exec! conn ["COMMIT"]))
+        (t/is (thrown? clojure.lang.ExceptionInfo
+                       (invoke-nexus metrics {:uri archive-uri})))
+        ;; The first chunk committed and the cursor moved past it.
+        (t/is (= 172 (unread-count consumer/consumer-nexus)))
+        (t/is (= 128.0 (counter-value metrics :audit-consumer-events ["nexus" "processed"])))
+        (t/is (= 128.0 (counter-value metrics :audit-consumer-events ["nexus" "failed"])))
+        (t/is (= 1.0 (counter-value metrics :audit-consumer-passes ["nexus" "failed"])))))))
+
+(t/deftest consumer-busy-does-not-sample-the-lag
+  (let [prof    (th/create-profile* 41 {:is-active true})
+        metrics (make-consumer-metrics)]
+    (with-redefs [cf/flags #{:nexus}]
+      (with-mocks [http-mock {:target 'app.http.client/req :return {:status 204}}]
+        (insert-audit-row (:id prof) "create-project")
+        (invoke-nexus metrics {:uri archive-uri})
+        (t/is (zero? (gauge-value metrics :audit-consumer-lag ["nexus"])))
+
+        (insert-audit-row (:id prof) "create-file")
+        (with-open [conn (db/open th/*system*)]
+          (let [tick (hold-tick conn consumer/consumer-nexus)]
+            (t/is (= ::consumer/busy (invoke-nexus metrics {:uri archive-uri})))
+            (release-tick conn tick)))
+        ;; Still the sample of the first pass, not the row behind.
+        (t/is (zero? (gauge-value metrics :audit-consumer-lag ["nexus"])))))))
+
+(t/deftest consumer-pass-sends-full-chunks-under-continuous-traffic
+  (let [prof    (th/create-profile* 42 {:is-active true})
+        arrived (atom 0)]
+    (with-redefs [cf/flags #{:nexus}]
+      (with-mocks [http-mock {:target 'app.http.client/req
+                              :return (fn [_ _ & _]
+                                        (swap! arrived inc)
+                                        (insert-audit-row (:id prof) (str "during-" @arrived))
+                                        {:status 204})}]
+        (with-open [conn (db/open th/*system*)]
+          (insert-rows-in-one-transaction conn "lote-" 300)
+          (db/exec! conn ["COMMIT"]))
+        (run-nexus {:uri archive-uri})
+        (let [bodies (map #(transit/decode (:body (second %)))
+                          (:call-args-list @http-mock))]
+          (t/is (= [128 128 44] (mapv #(count (:events %)) bodies))))
+        ;; The rows that arrived during the pass wait for the next one.
+        (t/is (= 3 (unread-count consumer/consumer-nexus)))))))
+
+(t/deftest consumer-component-does-not-start-on-a-read-only-database
+  (let [pool (make-pool 1 {::db/read-only true})]
+    (try
+      (with-redefs [cf/flags #{:nexus}]
+        (t/is (nil? (ig/init-key :app.loggers.audit.consumers.nexus/consumer
+                                 (merge (nexus-cfg archive-uri) {::db/pool pool})))))
+      (finally
+        (ig/halt-key! :app.db/pool pool)))))
+
+(t/deftest consumer-lag-gauge-is-capped
+  ;; The gauge counts behind the cursor once per pass; past 10000 it
+  ;; saturates, so a long backlog does not turn every pass into an
+  ;; O(backlog) count. Remove the LIMIT and this test fails.
+  (let [prof    (th/create-profile* 44 {:is-active true})
+        metrics (make-consumer-metrics)]
+    (with-open [conn (db/open th/*system*)]
+      (insert-rows-in-one-transaction conn "lote-" 10001)
+      (db/exec! conn ["COMMIT"]))
+    (with-open [conn (db/open th/*system*)]
+      (#'consumer/record-lag conn metrics {:id consumer/consumer-nexus}))
+    (t/is (= 10000.0 (gauge-value metrics :audit-consumer-lag ["nexus"])))))
 
 (t/deftest consumer-nexus-transport-failure-records-failed
   (let [prof    (th/create-profile* 42 {:is-active true})
@@ -683,11 +1040,13 @@
       (audit/submit* {::db/pool (:app.db/pool th/*system*)}
                      (full-event (:id prof)))
       (t/is (= 1 (count (th/db-exec! ["SELECT * FROM audit_log"]))))
-      ;; The pending queue is gone: the migration dropped it and the
-      ;; producer has no queue to fill.
-      (t/is (nil? (th/db-exec-one!
-                   ["SELECT table_name FROM information_schema.tables
-                      WHERE table_schema = 'public' AND table_name = 'audit_log_pending'"])))
+      ;; The producer never fills the pending queue: the row exists, the
+      ;; queue stays empty (or absent, on an installation that predates it).
+      (let [{:keys [pending]} (th/db-exec-one!
+                               ["SELECT to_regclass('public.audit_log_pending') AS pending"])]
+        (t/is (or (nil? pending)
+                  (zero? (:cnt (th/db-exec-one!
+                                ["SELECT count(*) AS cnt FROM audit_log_pending"]))))))
       ;; The cursors did not move: the row waits for the next drain.
       (t/is (= 1 (unread-count consumer/consumer-nexus)))
       (t/is (= 1 (unread-count consumer/consumer-admin-console))))))
@@ -787,7 +1146,9 @@
         (t/is (= 1 (count (th/db-exec! ["SELECT * FROM audit_log"]))))
         ;; Its first drain creates the cursor at the end (it does not
         ;; process the history), and the next GC can delete.
-        (th/run-task! :audit-log-consumer-team-storage {})
+        (team-storage/execute-audit-log-consumer-team-storage
+         {::db/pool     (:app.db/pool th/*system*)
+          ::mtx/metrics (:app.metrics/metrics th/*system*)})
         (t/is (some? (cursor-of consumer/consumer-team-storage)))
         (t/is (= 1 (run-gc)))
         (t/is (= 0 (count (th/db-exec! ["SELECT * FROM audit_log"]))))))))

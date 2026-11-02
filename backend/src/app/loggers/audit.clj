@@ -407,12 +407,13 @@
 (defn- coerce-profile-id
   "Normalize a hand-written `::audit/profile-id` override to a uuid.
 
-  `schema:event` requires a uuid and `submit*` swallows the validation
-  error, so a value that is not a uuid loses the event instead of
-  failing loudly. Commands read the override from places that are not
-  typed by us (token claims, stringly-typed drivers), so a string has
-  to be accepted. Anything that cannot become a uuid is discarded, and
-  the event falls back to the caller, which is always a valid uuid."
+  `schema:event` requires a uuid and `submit*` propagates the validation
+  error; inside a command, `wrap-audit` runs in its transaction, so an
+  invalid override would abort the whole action. Commands read the
+  override from places that are not typed by us (token claims,
+  stringly-typed drivers), so a string has to be accepted. Anything that
+  cannot become a uuid is discarded, and the event falls back to the
+  caller, which is always a valid uuid."
   [v]
   (let [coerced (cond
                   ;; Fast path: the override comes straight from a `profile`

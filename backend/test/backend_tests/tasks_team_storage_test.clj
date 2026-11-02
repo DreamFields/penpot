@@ -9,7 +9,6 @@
   storage-usage consumer: selective queueing, dirty marking, bounded
   recompute and quota reads."
   (:require
-   [app.common.logging :as l]
    [app.common.time :as ct]
    [app.common.uuid :as uuid]
    [app.config :as cf]
@@ -26,6 +25,7 @@
    [app.tasks.team-storage :as team-storage]
    [backend-tests.helpers :as th]
    [clojure.test :as t]
+   [integrant.core :as ig]
    [mockery.core :refer [with-mocks]]))
 
 (t/use-fixtures :once th/state-init)
@@ -70,9 +70,15 @@
               WHERE (a.xid, a.seq) > (?::xid8, ?::bigint)"
             xid seq]))))
 
+(defn- team-storage-consumer-cfg
+  []
+  {::db/pool     (:app.db/pool th/*system*)
+   ::mtx/metrics (:app.metrics/metrics th/*system*)})
+
 (defn- run-team-storage
   []
-  (th/run-task! :audit-log-consumer-team-storage {}))
+  (team-storage/execute-audit-log-consumer-team-storage
+   (team-storage-consumer-cfg)))
 
 (defn- usage-row
   [team-id]
@@ -106,6 +112,27 @@
       (append-row "hard-delete-objects" {:team-ids [team]})
       (run-team-storage)
       (t/is (nil? (:dirty-at (usage-row team)))))))
+
+(t/deftest consumer-component-does-not-start-with-the-flag-off
+  (with-redefs [cf/flags #{}]
+    (t/is (nil? (ig/init-key :app.tasks.team-storage/consumer
+                             (team-storage-consumer-cfg))))))
+
+(t/deftest consumer-component-drains-and-stops
+  (let [prof (th/create-profile* 63 {:is-active true})
+        team (:default-team-id prof)]
+    (with-redefs-fn {#'cf/flags test-flags
+                     #'consumer/sleep-ms 10}
+      (fn []
+        (append-row "upload-file-media-object" {:team-id team})
+        (let [thread (ig/init-key :app.tasks.team-storage/consumer
+                                  (team-storage-consumer-cfg))]
+          (try
+            (t/is (th/wait-for #(some? (:dirty-at (usage-row team)))))
+            (finally
+              (ig/halt-key! :app.tasks.team-storage/consumer thread)))
+          (.join ^Thread thread 5000)
+          (t/is (false? (.isAlive ^Thread thread))))))))
 
 (t/deftest storage-usage-consumer-covers-every-listed-name
   ;; Pins the reaction contract for every name in
@@ -227,46 +254,6 @@
       (t/is (nil? (:dirty-at row)))
       (t/is (= (inst-ms past) (inst-ms (:updated-at row)))))))
 
-(t/deftest storage-usage-chunk-warns-on-a-nil-team-id
-  ;; A key present with a nil value is the producer-failed shape: it
-  ;; must not pass as "carries its keys".
-  (let [records (atom [])
-        _       (add-watch l/log-record ::capture
-                           (fn [_ _ _ record] (swap! records conj record)))]
-    (with-redefs [cf/flags test-flags]
-      (append-row "delete-file" {:team-id nil})
-      (try
-        (run-team-storage)
-        (finally
-          (remove-watch l/log-record ::capture)))
-      (t/is (= 0 (unread-count)))
-      (t/is (let [deadline (+ (System/currentTimeMillis) 5000)]
-              (loop []
-                (if (some #(= "storage-usage chunk resolved no team ids"
-                              (get (::l/props %) :hint))
-                          @records)
-                  true
-                  (when (< (System/currentTimeMillis) deadline)
-                    (Thread/sleep 50)
-                    (recur)))))))))
-
-(t/deftest storage-usage-chunk-does-not-warn-on-explicit-empty-teams
-  ;; A profile that owns no team sends :team-ids [] on purpose: that is
-  ;; a fact, not a producer that lost its keys.
-  (let [records (atom [])
-        _       (add-watch l/log-record ::capture
-                           (fn [_ _ _ record] (swap! records conj record)))]
-    (with-redefs [cf/flags test-flags]
-      (append-row "restore-profile" {:id (uuid/next) :team-ids []})
-      (try
-        (run-team-storage)
-        (finally
-          (remove-watch l/log-record ::capture)))
-      (t/is (= 0 (unread-count)))
-      (t/is (not-any? #(= "storage-usage chunk resolved no team ids"
-                          (get (::l/props %) :hint))
-                      @records)))))
-
 (t/deftest events-drain-does-not-wait-on-a-locked-audit-log-row
   ;; The drain locks only the cursor row; the audit_log rows are read
   ;; without locking, so another transaction holding one of them does
@@ -290,31 +277,20 @@
           (t/is (some? (:dirty-at (usage-row team-a))))
           (t/is (some? (:dirty-at (usage-row team-b)))))))))
 
-(t/deftest storage-usage-chunk-warns-on-empty-resolution
-  ;; A relevant event that resolves no team is a producer that stopped
-  ;; carrying team keys: the chunk logs it instead of going stale in
-  ;; silence. (Only the keyless event is appended: any valid team
-  ;; would mark and silence the warn by design. Logging is async, so
-  ;; the assert polls like objects-gc-test does.)
-  (let [records (atom [])
-        _       (add-watch l/log-record ::capture
-                           (fn [_ _ _ record] (swap! records conj record)))]
-    (with-redefs [cf/flags test-flags]
-      (append-row "delete-file" {})
-      (try
-        (run-team-storage)
-        (finally
-          (remove-watch l/log-record ::capture)))
-      (t/is (= 0 (unread-count)))
-      (t/is (let [deadline (+ (System/currentTimeMillis) 5000)]
-              (loop []
-                (if (some #(= "storage-usage chunk resolved no team ids"
-                              (get (::l/props %) :hint))
-                          @records)
-                  true
-                  (when (< (System/currentTimeMillis) deadline)
-                    (Thread/sleep 50)
-                    (recur)))))))))
+(t/deftest storage-usage-chunk-skips-events-that-resolve-no-team
+  ;; A key present with nil, an explicit empty list and a keyless event
+  ;; resolve no team. The drain passes over them and marks nothing, so the
+  ;; chunk completes instead of wedging the cursor.
+  (with-redefs [cf/flags test-flags]
+    (append-row "delete-file" {:team-id nil})
+    (append-row "restore-profile" {:id (uuid/next) :team-ids []})
+    (append-row "delete-file" {})
+    (t/is (= 3 (unread-count)))
+    (run-team-storage)
+    (t/is (= 0 (unread-count)))
+    (t/is (zero? (:cnt (th/db-exec-one!
+                        ["SELECT count(*) AS cnt FROM team_storage_usage
+                          WHERE dirty_at IS NOT NULL"]))))))
 
 (t/deftest storage-usage-real-delete-file-emits-the-event
   ;; As end-to-end as the harness allows (wrap-audit is decided at

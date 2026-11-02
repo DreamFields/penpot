@@ -6,6 +6,7 @@
 
 (ns backend-tests.migrations-test
   (:require
+   [app.common.uuid :as uuid]
    [app.db :as db]
    [app.migrations :as migrations]
    [app.util.migrations :as mg]
@@ -146,8 +147,48 @@
   (t/testing "one row per consumer, with the position and its clock"
     (t/is (= #{"consumer" "xid" "seq" "updated_at"}
              (table-columns "audit_log_consumer_cursor"))))
-  (t/testing "the pending queue is gone"
-    (t/is (empty? (table-columns "audit_log_pending")))))
+  (t/testing "the old queue keeps its position columns"
+    (t/is (contains? (table-columns "audit_log_pending") "consumer"))))
+
+(t/deftest the-old-queue-survives-the-migration-without-its-fk
+  ;; The pending queue stays one release (the previous version keeps
+  ;; writing to it during a rolling upgrade) but its FK has to go, or the
+  ;; leftover rows would block the new GC when it deletes the rows they
+  ;; reference. Recreate the pre-migration shape and run the migration
+  ;; again to pin it.
+  (th/db-exec! ["CREATE TABLE IF NOT EXISTS audit_log_pending (
+                   audit_log_id uuid NOT NULL REFERENCES audit_log(id) DEFERRABLE,
+                   consumer smallint NOT NULL CHECK (consumer BETWEEN 1 AND 20),
+                   PRIMARY KEY (consumer, audit_log_id))"])
+  (th/db-exec! ["ALTER TABLE audit_log_pending
+                   DROP CONSTRAINT IF EXISTS audit_log_pending_audit_log_id_fkey"])
+  (th/db-exec! ["ALTER TABLE audit_log_pending
+                   ADD CONSTRAINT audit_log_pending_audit_log_id_fkey
+                   FOREIGN KEY (audit_log_id) REFERENCES audit_log(id) DEFERRABLE"])
+  (t/is (seq (table-foreign-keys "audit_log_pending")))
+  (let [apply! (mg/resource "app/migrations/sql/0158-consumer-generalization.sql")]
+    (t/is (true? (apply! th/*pool*))))
+  (t/is (contains? (table-columns "audit_log_pending") "consumer"))
+  (t/is (empty? (table-foreign-keys "audit_log_pending"))))
+
+(t/deftest audit-log-rows-get-seq-and-xid-by-default
+  ;; The previous version keeps inserting rows during the rollout, so the
+  ;; database must fill both columns, and the new rows must sort above the
+  ;; backfilled history (the reserved low range).
+  (let [id (uuid/next)]
+    (try
+      (th/db-exec! ["INSERT INTO audit_log (id, name, type, source, profile_id,
+                                            ip_addr, props, context, tracked_at, created_at)
+                     VALUES (?, 'create-project', 'action', 'backend', ?,
+                             '127.0.0.1', ?, ?, now(), now())"
+                    id uuid/zero (db/tjson {}) (db/tjson {})])
+      (let [row (th/db-exec-one! ["SELECT seq, xid::text AS xid
+                                     FROM audit_log WHERE id = ?" id])]
+        (t/is (some? (:seq row)))
+        (t/is (>= (:seq row) 1000000))
+        (t/is (not= "0" (:xid row))))
+      (finally
+        (th/db-exec! ["DELETE FROM audit_log WHERE id = ?" id])))))
 
 (defn- indexdef
   [index-name]
@@ -188,14 +229,20 @@
         (t/is (not (str/includes? def (str "'" status "'")))
               (str "the " status " status leaves the index"))))))
 
-(t/deftest job-dedupe-migration-is-idempotent
-  ;; The out-of-band runbook of 0162 pre-applies the whole migration (the
-  ;; `dedupe` column and then the `CONCURRENTLY` index), so the migration
-  ;; must find both and do nothing when it runs afterwards.
-  (let [apply! (mg/resource "app/migrations/sql/0162-add-job-dedupe-column.sql")]
+(t/deftest consumer-generalization-migration-is-idempotent
+  ;; The out-of-band runbook pre-applies the whole migration (columns,
+  ;; CONCURRENTLY indexes, backfill), so the migration must find the schema
+  ;; and do nothing when it runs afterwards.
+  (let [apply! (mg/resource "app/migrations/sql/0158-consumer-generalization.sql")]
     (t/is (true? (apply! th/*pool*)))
+    (t/is (contains? (table-columns "job") "exclusive"))
     (t/is (contains? (table-columns "job") "dedupe"))
-    (t/is (contains? (table-indexes "job") "job__new_dedupe__uniq"))))
+    (t/is (contains? (table-indexes "job") "job__live_exclusive__uniq"))
+    (t/is (contains? (table-indexes "job") "job__new_dedupe__uniq"))
+    (t/is (contains? (table-columns "audit_log") "seq"))
+    (t/is (contains? (table-columns "audit_log") "xid"))
+    (t/is (contains? (table-indexes "audit_log") "audit_log__xid__seq__idx"))
+    (t/is (contains? (table-columns "audit_log_consumer_cursor") "consumer"))))
 
 (t/deftest job-live-exclusive-index-admits-one-live-row-per-key
   ;; The exclusion of the live jobs is the index, not a check that races

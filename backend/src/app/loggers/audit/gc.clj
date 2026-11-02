@@ -41,19 +41,18 @@
   that is about to start could still read."
   [cfg consumer-ids]
   (when (seq consumer-ids)
-    (let [ids   (str/join "," consumer-ids)
-          total (count consumer-ids)
-          found (:cnt (db/exec-one! cfg
-                                    [(str "SELECT count(*) AS cnt"
-                                          "  FROM audit_log_consumer_cursor"
-                                          " WHERE consumer IN (" ids ")")]))]
-      (when (= found total)
-        (db/exec-one! cfg
-                      [(str "SELECT xid::text AS xid, seq"
-                            "  FROM audit_log_consumer_cursor"
-                            " WHERE consumer IN (" ids ")"
-                            " ORDER BY xid ASC, seq ASC"
-                            " LIMIT 1")])))))
+    (let [placeholders (str/join "," (repeat (count consumer-ids) "?"))
+          ;; One query: the position of every enabled consumer and, in the
+          ;; same result, how many of them exist.
+          rows (db/exec! cfg
+                         (into [(str "SELECT xid::text AS xid, seq,"
+                                     "       count(*) OVER () AS total"
+                                     "  FROM audit_log_consumer_cursor"
+                                     " WHERE consumer IN (" placeholders ")"
+                                     " ORDER BY xid ASC, seq ASC")]
+                               consumer-ids))]
+      (when (= (count consumer-ids) (:total (first rows)))
+        (select-keys (first rows) [:xid :seq])))))
 
 (def ^:private max-xid
   "Any real row sorts before it: used when no consumer is enabled, so

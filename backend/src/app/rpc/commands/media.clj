@@ -48,7 +48,7 @@
      JOIN project AS p ON (p.id = f.project_id)
     WHERE f.id = ?")
 
-(defn- check-media-storage-quote!
+(defn- check-media-storage-quote
   "Apply the media-storage-bytes-per-team quota to a file that is about
   to receive `size` bytes, and answer its team id (the audit props need
   it). The counter path is cheap: the live SUM only runs with the
@@ -81,7 +81,7 @@
   (media.v/validate-media-type! content)
   (media.v/validate-media-size! content)
 
-  (let [team-id (check-media-storage-quote! cfg file-id profile-id (:size content))]
+  (let [team-id (check-media-storage-quote cfg file-id profile-id (:size content))]
     (db/run! cfg (fn [{:keys [::db/conn] :as cfg}]
                    ;; We get the minimal file for proper checking if
                    ;; file is not already deleted
@@ -271,7 +271,7 @@
 
     ;; The URL path writes bytes too: it must pay the same quota as a
     ;; plain upload, not bypass it.
-    (check-media-storage-quote! cfg (:file-id params) (:profile-id params) (:size content))
+    (check-media-storage-quote cfg (:file-id params) (:profile-id params) (:size content))
 
     (db/run! cfg create-file-media-object params)))
 
@@ -587,7 +587,7 @@
                                   (assoc :mtype mtype)
                                   (media.v/validate-media-type!)
                                   (media.v/validate-media-size!))
-                      _       (check-media-storage-quote! cfg file-id profile-id (:size content))
+                      _       (check-media-storage-quote cfg file-id profile-id (:size content))
                       mobj    (create-file-media-object cfg (assoc params
                                                                    :from-chunks? true
                                                                    :content content))]

@@ -27,9 +27,10 @@
    [app.http.websocket :as http.ws]
    [app.jobs :as-alias jobs]
    [app.jobs.gc :as-alias jobs.gc]
-   ;; The consumer transports live in their own namespaces; they are
-   ;; required here for their side effect: the `ig/init-key` method of
-   ;; their job-def has to be registered before the components start.
+   ;; The consumer transports live in their own namespaces; requiring them
+   ;; registers their `ig/init-key`/`ig/halt-key!` methods before the
+   ;; worker components start (`ig/load-namespaces` also loads them from
+   ;; the config keys).
    [app.loggers.audit.consumers.admin-console]
    [app.loggers.audit.consumers.nexus]
    [app.loggers.audit.gc]
@@ -363,7 +364,13 @@
 
    :audit-consumer-events
    {::mdef/name "penpot_audit_consumer_events_total"
-    ::mdef/help "Audit log events drained by the consumer task, by destination and outcome."
+    ::mdef/help "Audit log events drained by the audit-log consumers, by destination and outcome."
+    ::mdef/labels ["destination" "outcome"]
+    ::mdef/type :counter}
+
+   :audit-consumer-passes
+   {::mdef/name "penpot_audit_consumer_passes_total"
+    ::mdef/help "Audit log consumer passes, by destination and outcome."
     ::mdef/labels ["destination" "outcome"]
     ::mdef/type :counter}
 
@@ -375,7 +382,7 @@
 
    :audit-consumer-lag
    {::mdef/name "penpot_audit_consumer_lag_events"
-    ::mdef/help "Audit log events confirmed in the buffer that a consumer has not processed yet."
+    ::mdef/help "Audit log events confirmed in the buffer that a consumer has not processed yet (capped at 10000)."
     ::mdef/labels ["destination"]
     ::mdef/type :gauge}
 
@@ -614,8 +621,7 @@
 
    :app.nitrate/client
    {::http.client/client (ig/ref ::http.client/client)
-    ;; No ::jobs/defs: nitrate never submits jobs, and consumer-task's
-    ;; job-def needs this client — that would cycle through jobs/defs.
+    ;; No ::jobs/defs: nitrate never submits jobs.
     ::setup/shared-keys  (ig/ref ::setup/shared-keys)}
 
    :app.rpc/management-methods
@@ -662,9 +668,6 @@
     :telemetry                      (ig/ref :app.tasks.telemetry/job-def)
     :session-gc                     (ig/ref ::session/job-def)
     :file-gc-scheduler              (ig/ref :app.tasks.file-gc-scheduler/job-def)
-    :audit-log-consumer-nexus        (ig/ref :app.loggers.audit.consumers.nexus/job-def)
-    :audit-log-consumer-admin-console (ig/ref :app.loggers.audit.consumers.admin-console/job-def)
-    :audit-log-consumer-team-storage  (ig/ref :app.tasks.team-storage/consumer-job-def)
     :audit-log-gc                     (ig/ref :app.loggers.audit.gc/job-def)}
 
    ::jobs/request-pool
@@ -704,10 +707,6 @@
     ::mtx/metrics (ig/ref ::mtx/metrics)}
 
    :app.tasks.team-storage/worker-job-def
-   {::db/pool     (ig/ref ::db/pool)
-    ::mtx/metrics (ig/ref ::mtx/metrics)}
-
-   :app.tasks.team-storage/consumer-job-def
    {::db/pool     (ig/ref ::db/pool)
     ::mtx/metrics (ig/ref ::mtx/metrics)}
 
@@ -765,17 +764,6 @@
    :app.tasks.file-gc-scheduler/job-def
    {::db/pool     (ig/ref ::db/pool)
     ::mtx/metrics (ig/ref ::mtx/metrics)}
-
-   :app.loggers.audit.consumers.nexus/job-def
-   {::db/pool            (ig/ref ::db/pool)
-    ::http.client/client (ig/ref ::http.client/client)
-    ::setup/shared-keys  (ig/ref ::setup/shared-keys)
-    ::mtx/metrics        (ig/ref ::mtx/metrics)}
-
-   :app.loggers.audit.consumers.admin-console/job-def
-   {::db/pool            (ig/ref ::db/pool)
-    :app.nitrate/client  (ig/ref :app.nitrate/client)
-    ::mtx/metrics        (ig/ref ::mtx/metrics)}
 
    :app.loggers.audit.gc/job-def
    {::db/pool     (ig/ref ::db/pool)
@@ -876,9 +864,8 @@
     ::db/pool                 (ig/ref ::db/pool)
     ::mtx/metrics             (ig/ref ::mtx/metrics)
     ::wrk/entries
-    ;; a flag may contribute several entries (storage-usage does): each
-    ;; element is one entry or a seq of them
-    (into [] (mapcat #(if (map? %) [%] %))
+    ;; A flag either contributes one entry or none.
+    (into [] (remove nil?)
           [{:cron #penpot/cron "0 0 0 * * ?" ;; daily
             :job :session-gc}
 
@@ -903,22 +890,12 @@
            {:cron #penpot/cron "0 30 */3,23 * * ?"
             :job :telemetry}
 
-           (when (contains? cf/flags :nexus)
-             {:cron #penpot/cron "0 */5 * * * ?" ;; every 5m
-              :job :audit-log-consumer-nexus})
-
-           (when (contains? cf/flags :admin-console)
-             {:cron #penpot/cron "30 */5 * * * ?" ;; every 5m, offset 30s from nexus
-              :job :audit-log-consumer-admin-console})
-
            (when (contains? cf/flags :storage-usage)
-             [{:cron #penpot/cron "15 */5 * * * ?" ;; every 5m, offset 15s
-               :job :audit-log-consumer-team-storage}
-              {:cron #penpot/cron "45 */10 * * * ?" ;; every 10m, after the drain
-               :job :schedule-team-storage}])
+             {:cron #penpot/cron "45 */10 * * * ?" ;; every 10m
+              :job :schedule-team-storage})
 
            (when (contains? cf/flags :audit-log)
-             {:cron #penpot/cron "45 */5 * * * ?" ;; every 5m, after the three drains
+             {:cron #penpot/cron "45 */5 * * * ?" ;; every 5m
               :job :audit-log-gc})])}
 
    ::wrk/dispatcher
@@ -978,7 +955,25 @@
     ::jobs/defs       (ig/ref ::jobs/defs)
     ::mtx/metrics     (ig/ref ::mtx/metrics)
     ::db/pool         (ig/ref ::db/pool)
-    ::mbus/msgbus     (ig/ref ::mbus/msgbus)}})
+    ::mbus/msgbus     (ig/ref ::mbus/msgbus)}
+
+   ;; The audit-log consumers are loops, not jobs: each one starts a
+   ;; thread that takes its tick lock, drains up to the frontier of the
+   ;; pass and sleeps. Only worker instances run them.
+   :app.loggers.audit.consumers.nexus/consumer
+   {::db/pool            (ig/ref ::db/pool)
+    ::http.client/client (ig/ref ::http.client/client)
+    ::setup/shared-keys  (ig/ref ::setup/shared-keys)
+    ::mtx/metrics        (ig/ref ::mtx/metrics)}
+
+   :app.loggers.audit.consumers.admin-console/consumer
+   {::db/pool            (ig/ref ::db/pool)
+    :app.nitrate/client  (ig/ref :app.nitrate/client)
+    ::mtx/metrics        (ig/ref ::mtx/metrics)}
+
+   :app.tasks.team-storage/consumer
+   {::db/pool     (ig/ref ::db/pool)
+    ::mtx/metrics (ig/ref ::mtx/metrics)}})
 
 
 (defn start
