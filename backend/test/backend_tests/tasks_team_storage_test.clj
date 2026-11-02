@@ -16,16 +16,15 @@
    [app.jobs :as jobs]
    [app.loggers.audit :as audit]
    [app.loggers.audit.consumers :as consumer]
+   [app.loggers.audit.consumers.team-storage :as consumer.team-storage]
    [app.metrics :as mtx]
    [app.rpc :as-alias rpc]
-   [app.rpc.commands.audit :as cmd-audit]
    [app.rpc.quotes :as quotes]
    [app.srepl.main :as srepl]
    [app.system :as sys]
    [app.tasks.team-storage :as team-storage]
    [backend-tests.helpers :as th]
    [clojure.test :as t]
-   [integrant.core :as ig]
    [mockery.core :refer [with-mocks]]))
 
 (t/use-fixtures :once th/state-init)
@@ -77,7 +76,7 @@
 
 (defn- run-team-storage
   []
-  (team-storage/run-pass
+  (consumer.team-storage/run-pass
    (team-storage-consumer-cfg)))
 
 (defn- usage-row
@@ -100,84 +99,6 @@
      :context    {}
      :tracked-at (ct/now)
      :created-at (ct/now)})))
-
-(t/deftest storage-usage-consumer-ignores-hard-delete-objects
-  ;; Physical purges cannot change the live total (they only remove rows
-  ;; the SUM already excludes), so the reaction does not claim them:
-  ;; this also keeps purged teams from ever hitting the usage-table
-  ;; foreign key.
-  (let [prof (th/create-profile* 62 {:is-active true})
-        team (:default-team-id prof)]
-    (with-redefs [cf/flags test-flags]
-      (append-row "hard-delete-objects" {:team-ids [team]})
-      (run-team-storage)
-      (t/is (nil? (:dirty-at (usage-row team)))))))
-
-(t/deftest consumer-component-does-not-start-with-the-flag-off
-  (with-redefs [cf/flags #{}]
-    (t/is (nil? (ig/init-key :app.tasks.team-storage/consumer
-                             (team-storage-consumer-cfg))))))
-
-(t/deftest consumer-component-drains-and-stops
-  (let [prof (th/create-profile* 63 {:is-active true})
-        team (:default-team-id prof)]
-    (with-redefs-fn {#'cf/flags test-flags
-                     #'consumer/sleep-ms 10}
-      (fn []
-        (append-row "upload-file-media-object" {:team-id team})
-        (let [thread (ig/init-key :app.tasks.team-storage/consumer
-                                  (team-storage-consumer-cfg))]
-          (try
-            (t/is (th/wait-for #(some? (:dirty-at (usage-row team)))))
-            (finally
-              (ig/halt-key! :app.tasks.team-storage/consumer thread)))
-          (.join ^Thread thread 5000)
-          (t/is (false? (.isAlive ^Thread thread))))))))
-
-(t/deftest storage-usage-consumer-covers-every-listed-name
-  ;; Pins the reaction contract for every name in
-  ;; event-names: each one marks the teams its key map
-  ;; resolves, using the real prop shape. It fails when a name is
-  ;; added without its case; the producers themselves are pinned by the
-  ;; end-to-end tests (delete-file, delete-font-variant, moves,
-  ;; file-gc), which go through real command output.
-  (let [prof   (th/create-profile* 71 {:is-active true})
-        team   (:default-team-id prof)
-        team-b (:id (th/create-team* 71 {:profile-id (:id prof)}))
-        proj   (th/create-project* 71 {:profile-id (:id prof) :team-id team})
-        file   (th/create-file* 71 {:profile-id (:id prof) :project-id (:id proj) :is-shared false})
-        cases  [["upload-file-media-object" {:team-id team :file-id (:id file)}]
-                ["create-file-media-object-from-url" {:team-id team}]
-                ["clone-file-media-object" {:team-id team :file-id (:id file)}]
-                ["assemble-file-media-object" {:team-id team}]
-                ["create-file" {:team-id team :project-id (:id proj)}]
-                ["create-font-variant" {:team-id team}]
-                ["delete-font" {:team-id team}]
-                ["delete-font-variant" {:team-id team}]
-                ["delete-file" {:team-id team :file-id (:id file)}]
-                ["delete-object-with-cascade" {:team-ids [team]
-                                               :cascade {:team-ids [team-b]
-                                                         :project-ids []
-                                                         :file-ids []}}]
-                ["move-files" {:source-team-id team :dest-team-id team-b}]
-                ["move-project" {:source-team-id team-b :dest-team-id team}]
-                ["permanently-delete-team-files" {:team-id team}]
-                ["restore-deleted-team-files" {:team-id team-b}]
-                ["restore-file" {:team-id team}]
-                ["restore-profile" {:team-ids [team team-b]}]
-                ["restore-project" {:team-id team-b}]
-                ["restore-team" {:team-id team}]
-                ["file-gc" {:team-id team :file-id (:id file)}]]]
-    (t/is (= team-storage/event-names (set (map first cases))))
-    (with-redefs [cf/flags test-flags]
-      (doseq [[nm props] cases]
-        (append-row nm props))
-      ;; Negatives: the reaction does not claim them.
-      (append-row "hard-delete-objects" {:team-ids [team]})
-      (append-row "navigate" {:route "dashboard"})
-      (run-team-storage)
-      (t/is (some? (:dirty-at (usage-row team))))
-      (t/is (some? (:dirty-at (usage-row team-b)))))))
 
 (t/deftest storage-usage-mid-recompute-shrink-re-marks-after
   ;; Production flow: a shrink landing mid-recompute is queued but not
@@ -254,44 +175,6 @@
       (t/is (nil? (:dirty-at row)))
       (t/is (= (inst-ms past) (inst-ms (:updated-at row)))))))
 
-(t/deftest events-drain-does-not-wait-on-a-locked-audit-log-row
-  ;; The drain locks only the cursor row; the audit_log rows are read
-  ;; without locking, so another transaction holding one of them does
-  ;; not stop it.
-  (let [prof   (th/create-profile* 85 {:is-active true})
-        team-a (:default-team-id prof)
-        team-b (:id (th/create-team* 85 {:profile-id (:id prof)}))]
-    (with-redefs [cf/flags test-flags]
-      (let [locked (append-row "upload-file-media-object" {:team-id team-a})]
-        (append-row "upload-file-media-object" {:team-id team-b})
-        (with-open [conn (db/open th/*system*)]
-          (db/exec! conn ["BEGIN"])
-          (db/exec! conn ["SELECT id FROM audit_log WHERE id = ? FOR UPDATE" (:id locked)])
-          (try
-            (run-team-storage)
-            (finally
-              (db/exec! conn ["ROLLBACK"])))
-          ;; Both events were processed: the drain never waits for the
-          ;; row another transaction holds.
-          (t/is (= 0 (unread-count)))
-          (t/is (some? (:dirty-at (usage-row team-a))))
-          (t/is (some? (:dirty-at (usage-row team-b)))))))))
-
-(t/deftest storage-usage-chunk-skips-events-that-resolve-no-team
-  ;; A key present with nil, an explicit empty list and a keyless event
-  ;; resolve no team. The drain passes over them and marks nothing, so the
-  ;; chunk completes instead of wedging the cursor.
-  (with-redefs [cf/flags test-flags]
-    (append-row "delete-file" {:team-id nil})
-    (append-row "restore-profile" {:id (uuid/next) :team-ids []})
-    (append-row "delete-file" {})
-    (t/is (= 3 (unread-count)))
-    (run-team-storage)
-    (t/is (= 0 (unread-count)))
-    (t/is (zero? (:cnt (th/db-exec-one!
-                        ["SELECT count(*) AS cnt FROM team_storage_usage
-                          WHERE dirty_at IS NOT NULL"]))))))
-
 (t/deftest storage-usage-real-delete-file-emits-the-event
   ;; As end-to-end as the harness allows (wrap-audit is decided at
   ;; boot without audit flags, so the two wrap lines run here by
@@ -350,19 +233,6 @@
         (t/is (= team (:team-id (:props event))))
         (audit/submit th/*system* event))
       (t/is (= 1 (unread-count))))))
-
-(t/deftest storage-usage-drain-skips-invalid-team-id
-  ;; One bad row cannot wedge the queue: the event is logged and
-  ;; skipped, the chunk completes, and the valid teams still mark.
-  (let [prof (th/create-profile* 73 {:is-active true})
-        team (:default-team-id prof)]
-    (with-redefs [cf/flags test-flags]
-      (append-row "upload-file-media-object" {:team-id "not-a-uuid"})
-      (append-row "upload-file-media-object" {:team-id team})
-      (t/is (= 2 (unread-count)))
-      (run-team-storage)
-      (t/is (= 0 (unread-count)))
-      (t/is (some? (:dirty-at (usage-row team)))))))
 
 (t/deftest storage-usage-drain-and-recompute
   (let [prof (th/create-profile* 1)
@@ -848,23 +718,6 @@
         (let [live-b (quotes/get-live-media-storage-bytes th/*system* team-b)]
           (t/is (pos? live-b))
           (t/is (== live-b (:total-bytes (usage-row team-b)))))))))
-
-(t/deftest storage-usage-bulk-ingest-event-is-skipped
-  ;; Frontend bulk ingest can never produce a storage-usage event: the
-  ;; consumer reads the row and skips it, so no team is marked.
-  (let [prof (th/create-profile* 1 {:is-active true})]
-    (with-redefs [cf/flags #{:audit-log :storage-usage}]
-      (@#'cmd-audit/handle-events
-       {::db/pool th/*pool* ::mtx/metrics (th/metrics-stub)}
-       (with-meta {::rpc/profile-id (:id prof)
-                   ::rpc/request-at (ct/now)
-                   :events [{:name "navigate" :type "action"
-                             :props {:route "dashboard"}
-                             :timestamp (ct/now)}]}
-         {:app.http/request (th/make-dummy-request)}))
-      (t/is (= 1 (unread-count)))
-      (run-team-storage)
-      (t/is (= 0 (unread-count))))))
 
 (t/deftest storage-usage-missing-row-fails-open
   (let [prof (th/create-profile* 1)

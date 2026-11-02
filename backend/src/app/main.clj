@@ -33,6 +33,7 @@
    ;; the config keys).
    [app.loggers.audit.consumers.admin-console]
    [app.loggers.audit.consumers.nexus]
+   [app.loggers.audit.consumers.team-storage]
    [app.loggers.audit.gc]
    [app.loggers.webhooks :as-alias webhooks]
    [app.metrics :as mtx]
@@ -971,7 +972,7 @@
     :app.nitrate/client  (ig/ref :app.nitrate/client)
     ::mtx/metrics        (ig/ref ::mtx/metrics)}
 
-   :app.tasks.team-storage/consumer
+   :app.loggers.audit.consumers.team-storage/consumer
    {::db/pool     (ig/ref ::db/pool)
     ::mtx/metrics (ig/ref ::mtx/metrics)}})
 

@@ -14,13 +14,13 @@
   - the admin-console consumer sends the allowlisted ones to the admin
     console.
   - the team-storage consumer marks dirty the teams whose media storage
-    may have changed (it lives in `app.tasks.team-storage`, its domain).
+    may have changed.
 
   Each transport lives in its own namespace (`...consumers.nexus`,
-  `...consumers.admin-console`); this one holds what they share: the
-  consumer ids, the catalog, the cursor (lock, read, advance), the tick
-  mutex, the loop and the metrics. The garbage collection of the buffer
-  lives in `app.loggers.audit.gc`.
+  `...consumers.admin-console`, `...consumers.team-storage`); this one
+  holds what they share: the consumer ids, the catalog, the cursor
+  (lock, read, advance), the tick mutex, the loop and the metrics. The
+  garbage collection of the buffer lives in `app.loggers.audit.gc`.
 
   A consumer is a loop in a thread, not a job: the pass takes the tick
   lock, drains up to the frontier it found at its start and sleeps. The

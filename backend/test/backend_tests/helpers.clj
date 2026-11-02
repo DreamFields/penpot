@@ -154,7 +154,7 @@
                            :app.worker/dispatcher
                            :app.loggers.audit.consumers.nexus/consumer
                            :app.loggers.audit.consumers.admin-console/consumer
-                           :app.tasks.team-storage/consumer)
+                           :app.loggers.audit.consumers.team-storage/consumer)
                    (remove-job-runners))
         _      (ig/load-namespaces system)
         system (-> (ig/expand system) (ig/init))]
