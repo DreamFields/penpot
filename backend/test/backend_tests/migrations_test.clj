@@ -171,6 +171,20 @@
   (t/is (contains? (table-columns "audit_log_pending") "consumer"))
   (t/is (empty? (table-foreign-keys "audit_log_pending"))))
 
+(t/deftest the-migration-seeds-the-existing-consumers-at-the-start
+  ;; The first deploy replays the buffer: Nexus and admin console start at
+  ;; (0, 0), and team storage (new) has no row, so `ensure-cursor` starts it
+  ;; at the end on its first pass.
+  (th/db-exec! ["DELETE FROM audit_log_consumer_cursor WHERE consumer IN (1, 2, 3)"])
+  (let [apply! (mg/resource "app/migrations/sql/0158-consumer-generalization.sql")]
+    (t/is (true? (apply! th/*pool*))))
+  (let [rows (th/db-exec! ["SELECT consumer, xid::text AS xid, seq
+                              FROM audit_log_consumer_cursor
+                             ORDER BY consumer"])]
+    (t/is (= [1 2] (mapv :consumer rows)))
+    (t/is (= ["0" "0"] (mapv :xid rows)))
+    (t/is (= [0 0] (mapv :seq rows)))))
+
 (t/deftest audit-log-rows-get-seq-and-xid-by-default
   ;; The previous version keeps inserting rows during the rollout, so the
   ;; database must fill both columns, and the new rows must sort above the

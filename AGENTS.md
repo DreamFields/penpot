@@ -17,8 +17,8 @@
 - **Never introduce a new function or macro name ending in `!`.** Side
   effects alone do not justify it: only the exceptions documented in
   `mem:clojure/design-rules` (public mutators of `app.db` and helpers over
-  transients), and a new one must be registered there with its
-  justification before it is used. Existing names stay until their
+  transients), and a new one must be registered in `mem:clojure/idioms`
+  with its justification before it is used. Existing names stay until their
   refactor; a new one fails review. See `mem:clojure/design-rules` before
   naming anything.
 - **Read `AGENTS.local.md` after this file whenever it exists.** It carries

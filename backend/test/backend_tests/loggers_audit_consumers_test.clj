@@ -728,6 +728,22 @@
       (finally
         (ig/halt-key! :app.db/pool pool)))))
 
+(t/deftest consumer-without-a-cursor-starts-at-the-end
+  ;; A consumer enabled after the deploy does not process the history: its
+  ;; first pass creates the cursor at the current end of the buffer.
+  (let [prof (th/create-profile* 45 {:is-active true})]
+    (with-redefs [cf/flags #{:nexus}]
+      (with-mocks [http-mock {:target 'app.http.client/req :return {:status 204}}]
+        (insert-audit-row (:id prof) "create-project")
+        (insert-audit-row (:id prof) "create-file")
+        (th/db-exec! ["DELETE FROM audit_log_consumer_cursor
+                        WHERE consumer = ?::smallint"
+                      consumer/consumer-nexus])
+        (run-nexus {:uri archive-uri})
+        (t/is (false? (:called? @http-mock)))
+        (t/is (some? (cursor-of consumer/consumer-nexus)))
+        (t/is (= 0 (unread-count consumer/consumer-nexus)))))))
+
 (t/deftest consumer-pass-stops-at-the-watermark
   ;; A pass drains up to the newest row that existed when it started: a
   ;; row committed while the pass runs is left for the next one, so the
