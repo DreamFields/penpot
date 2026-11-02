@@ -655,8 +655,8 @@
     :run-webhook                    (ig/ref ::webhooks/run-webhook-job-def)
     :process-webhook-event          (ig/ref ::webhooks/process-webhook-event-job-def)
     :file-gc                        (ig/ref :app.tasks.file-gc/job-def)
-    :schedule-team-storage           (ig/ref :app.tasks.team-storage/job-def)
-    :recompute-team-storage         (ig/ref :app.tasks.team-storage/worker-job-def)
+    :schedule-recompute-team-storage (ig/ref :app.tasks.team-storage/schedule-recompute-job-def)
+    :recompute-team-storage        (ig/ref :app.tasks.team-storage/recompute-job-def)
     :offload-file-data              (ig/ref :app.tasks.offload-file-data/job-def)
     :objects-gc                     (ig/ref :app.tasks.objects-gc/job-def)
     :export-binfile                 (ig/ref :app.tasks.export-binfile/job-def)
@@ -702,11 +702,11 @@
     ::sto/storage (ig/ref ::sto/storage)
     ::mtx/metrics (ig/ref ::mtx/metrics)}
 
-   :app.tasks.team-storage/job-def
+   :app.tasks.team-storage/schedule-recompute-job-def
    {::db/pool     (ig/ref ::db/pool)
     ::mtx/metrics (ig/ref ::mtx/metrics)}
 
-   :app.tasks.team-storage/worker-job-def
+   :app.tasks.team-storage/recompute-job-def
    {::db/pool     (ig/ref ::db/pool)
     ::mtx/metrics (ig/ref ::mtx/metrics)}
 
@@ -892,7 +892,7 @@
 
            (when (contains? cf/flags :storage-usage)
              {:cron #penpot/cron "45 */10 * * * ?" ;; every 10m
-              :job :schedule-team-storage})
+              :job :schedule-recompute-team-storage})
 
            (when (contains? cf/flags :audit-log)
              {:cron #penpot/cron "45 */5 * * * ?" ;; every 5m

@@ -195,7 +195,7 @@
                     (fn [conn team-id]
                       (append-row "delete-file" {:team-id team})
                       (real conn team-id))]
-        (th/run-task! :schedule-team-storage {})
+        (th/run-task! :schedule-recompute-team-storage {})
         (th/run-pending-jobs))
       ;; The stale mark is gone but the mid-run event is still unread.
       (t/is (nil? (:dirty-at (usage-row team))))
@@ -203,7 +203,7 @@
       ;; The drain re-marks from that event; the next tick clears it.
       (run-team-storage)
       (t/is (some? (:dirty-at (usage-row team))))
-      (th/run-task! :schedule-team-storage {})
+      (th/run-task! :schedule-recompute-team-storage {})
       (th/run-pending-jobs)
       (t/is (nil? (:dirty-at (usage-row team)))))))
 
@@ -386,7 +386,7 @@
       (let [row (usage-row team-id)]
         (t/is (some? row))
         (t/is (some? (:dirty-at row))))
-      (t/is (= 1 (th/run-task! :schedule-team-storage {})))
+      (t/is (= 1 (th/run-task! :schedule-recompute-team-storage {})))
       (th/run-pending-jobs)
       (let [row (usage-row team-id)
             live (quotes/get-live-media-storage-bytes th/*system* team-id)]
@@ -505,8 +505,8 @@
       (append-row "upload-file-media-object" {:team-id team-b})
       (append-row "upload-file-media-object" {:team-id team-a})
       (run-team-storage)
-      (t/is (= 2 (th/run-task! :schedule-team-storage {})))
-      (t/is (= 0 (th/run-task! :schedule-team-storage {})))
+      (t/is (= 2 (th/run-task! :schedule-recompute-team-storage {})))
+      (t/is (= 0 (th/run-task! :schedule-recompute-team-storage {})))
       (th/run-pending-jobs)
       (t/is (nil? (:dirty-at (usage-row team-a))))
       (t/is (nil? (:dirty-at (usage-row team-b)))))))
@@ -521,7 +521,7 @@
       (doseq [team teams]
         (append-row "upload-file-media-object" {:team-id team}))
       (run-team-storage)
-      (t/is (= 12 (th/run-task! :schedule-team-storage {})))
+      (t/is (= 12 (th/run-task! :schedule-recompute-team-storage {})))
       (let [rows (th/db-exec! ["SELECT (round((extract(epoch from (scheduled_at - created_at)) * 1000)::numeric, -3))::bigint AS delay_ms FROM job WHERE name = 'recompute-team-storage'"])]
         (t/is (= 12 (count rows)))
         (t/is (= {0 5, 5000 5, 10000 2} (frequencies (map :delay-ms rows))))))))
@@ -543,12 +543,12 @@
                                                    (when (> (swap! calls inc) 7)
                                                      (throw (ex-info "boom" {})))
                                                    (orig cfg opts))]
-                         (th/run-task! :schedule-team-storage {}))))
+                         (th/run-task! :schedule-recompute-team-storage {}))))
         ;; The first chunk committed before the failure; the second
         ;; rolled back whole.
         (t/is (= 5 (count (th/db-query :job {:name "recompute-team-storage"}))))
         ;; The next tick resumes: 5 live skipped, 7 fresh.
-        (t/is (= 7 (th/run-task! :schedule-team-storage {})))
+        (t/is (= 7 (th/run-task! :schedule-recompute-team-storage {})))
         (t/is (= 12 (count (th/db-query :job {:name "recompute-team-storage"}))))))))
 
 (t/deftest audit-submit-does-not-swallow-failures
@@ -570,7 +570,7 @@
     (th/db-insert! :team-storage-usage {:team-id stale :total-bytes 10 :updated-at old})
     (th/db-insert! :team-storage-usage {:team-id fresh :total-bytes 10})
     (with-redefs [cf/flags test-flags]
-      (t/is (= 1 (th/run-task! :schedule-team-storage {})))
+      (t/is (= 1 (th/run-task! :schedule-recompute-team-storage {})))
       (let [rows (th/db-exec! ["SELECT label FROM job WHERE name = 'recompute-team-storage'"])]
         (t/is (= [(str stale)] (mapv :label rows)))))))
 
@@ -582,7 +582,7 @@
     (with-redefs [cf/flags test-flags]
       (append-row "upload-file-media-object" {:team-id team})
       (run-team-storage)
-      (t/is (= 1 (th/run-task! :schedule-team-storage {})))
+      (t/is (= 1 (th/run-task! :schedule-recompute-team-storage {})))
       (let [row (th/db-exec-one! ["SELECT queue FROM job WHERE name = 'recompute-team-storage'"])]
         (t/is (= "storage" (:queue row)))))))
 
@@ -595,7 +595,7 @@
     (with-redefs [cf/flags test-flags]
       (append-row "upload-file-media-object" {:team-id team})
       (run-team-storage)
-      (t/is (= 1 (th/run-task! :schedule-team-storage {})))
+      (t/is (= 1 (th/run-task! :schedule-recompute-team-storage {})))
       (with-redefs [sys/system th/*system*]
         (srepl/delete-team! (str team)))
       (th/run-task! :objects-gc {:skip-delay true})
@@ -611,7 +611,7 @@
     (with-redefs [cf/flags test-flags]
       (append-row "upload-file-media-object" {:team-id team-id})
       (run-team-storage)
-      (t/is (= 1 (th/run-task! :schedule-team-storage {})))
+      (t/is (= 1 (th/run-task! :schedule-recompute-team-storage {})))
       (let [live-fn quotes/get-live-media-storage-bytes]
         (with-redefs [quotes/get-live-media-storage-bytes
                       (fn [conn id]
@@ -625,7 +625,7 @@
       ;; production); the next tick schedules the team again and this
       ;; time it succeeds.
       (th/db-force-delete :job {:name "recompute-team-storage"})
-      (t/is (= 1 (th/run-task! :schedule-team-storage {})))
+      (t/is (= 1 (th/run-task! :schedule-recompute-team-storage {})))
       (th/run-pending-jobs)
       (let [row  (usage-row team-id)
             live (quotes/get-live-media-storage-bytes th/*system* team-id)]
@@ -674,7 +674,7 @@
         (t/is (nil? (:error out))))
       (append-row "upload-file-media-object" {:team-id team :file-id (:id file)})
       (run-team-storage)
-      (th/run-task! :schedule-team-storage {})
+      (th/run-task! :schedule-recompute-team-storage {})
       (th/run-pending-jobs)
       (let [live (quotes/get-live-media-storage-bytes th/*system* team)]
         (t/is (pos? live))
@@ -682,7 +682,7 @@
       (with-redefs [sys/system th/*system*]
         (srepl/delete-team! (str team)))
       (run-team-storage)
-      (th/run-task! :schedule-team-storage {})
+      (th/run-task! :schedule-recompute-team-storage {})
       (th/run-pending-jobs)
       (t/is (== 0 (:total-bytes (usage-row team))))
       (with-redefs [sys/system th/*system*]
@@ -690,7 +690,7 @@
       (t/is (= 1 (unread-count)))
       (run-team-storage)
       (t/is (some? (:dirty-at (usage-row team))))
-      (th/run-task! :schedule-team-storage {})
+      (th/run-task! :schedule-recompute-team-storage {})
       (th/run-pending-jobs)
       (let [live (quotes/get-live-media-storage-bytes th/*system* team)]
         (t/is (pos? live))
@@ -708,7 +708,7 @@
         (t/is (nil? (:error out))))
       (th/run-pending-jobs)
       (run-team-storage)
-      (th/run-task! :schedule-team-storage {})
+      (th/run-task! :schedule-recompute-team-storage {})
       (th/run-pending-jobs)
       (with-redefs [sys/system th/*system*]
         (srepl/restore-file! (str (:id file))))
@@ -727,7 +727,7 @@
         (t/is (nil? (:error out))))
       (th/run-pending-jobs)
       (run-team-storage)
-      (th/run-task! :schedule-team-storage {})
+      (th/run-task! :schedule-recompute-team-storage {})
       (th/run-pending-jobs)
       (with-redefs [sys/system th/*system*]
         (srepl/restore-project! (str (:id proj))))
@@ -742,7 +742,7 @@
       (with-redefs [sys/system th/*system*]
         (srepl/delete-profile! (str (:id prof))))
       (run-team-storage)
-      (th/run-task! :schedule-team-storage {})
+      (th/run-task! :schedule-recompute-team-storage {})
       (th/run-pending-jobs)
       (with-redefs [sys/system th/*system*]
         (srepl/restore-profile! (str (:id prof))))
@@ -772,7 +772,7 @@
                                         :name "testfile"
                                         :content mfile})]
         (t/is (nil? (:error out))))
-      (th/run-task! :schedule-team-storage {})
+      (th/run-task! :schedule-recompute-team-storage {})
       (th/run-pending-jobs)
       (let [live-a (quotes/get-live-media-storage-bytes th/*system* team-a)]
         (t/is (pos? live-a))
@@ -794,7 +794,7 @@
         (run-team-storage)
         (t/is (some? (:dirty-at (usage-row team-a))))
         (t/is (some? (:dirty-at (usage-row team-b))))
-        (th/run-task! :schedule-team-storage {})
+        (th/run-task! :schedule-recompute-team-storage {})
         (th/run-pending-jobs)
         (t/is (== 0 (:total-bytes (usage-row team-a))))
         (let [live-b (quotes/get-live-media-storage-bytes th/*system* team-b)]
@@ -822,7 +822,7 @@
                                         :name "testfile"
                                         :content mfile})]
         (t/is (nil? (:error out))))
-      (th/run-task! :schedule-team-storage {})
+      (th/run-task! :schedule-recompute-team-storage {})
       (th/run-pending-jobs)
       (t/is (pos? (:total-bytes (usage-row team-a)))))
     ;; The move emits both teams explicitly in its event props.
@@ -842,7 +842,7 @@
         (run-team-storage)
         (t/is (some? (:dirty-at (usage-row team-a))))
         (t/is (some? (:dirty-at (usage-row team-b))))
-        (th/run-task! :schedule-team-storage {})
+        (th/run-task! :schedule-recompute-team-storage {})
         (th/run-pending-jobs)
         (t/is (== 0 (:total-bytes (usage-row team-a))))
         (let [live-b (quotes/get-live-media-storage-bytes th/*system* team-b)]
@@ -879,7 +879,7 @@
         (t/is (some? (:dirty-at row)))
         (t/is (= 0 (:total-bytes row))))
       ;; The row born on quota check is picked up by the next tick.
-      (t/is (= 1 (th/run-task! :schedule-team-storage {})))
+      (t/is (= 1 (th/run-task! :schedule-recompute-team-storage {})))
       (th/run-pending-jobs)
       (let [row  (usage-row team-id)
             live (quotes/get-live-media-storage-bytes th/*system* team-id)]
@@ -932,7 +932,7 @@
       (append-row "file-gc" {:file-id (:id file) :team-id team-id})
       (run-team-storage)
       (t/is (some? (:dirty-at (usage-row team-id))))
-      (t/is (= 1 (th/run-task! :schedule-team-storage {})))
+      (t/is (= 1 (th/run-task! :schedule-recompute-team-storage {})))
       (th/run-pending-jobs)
       (t/is (nil? (:dirty-at (usage-row team-id))))
       (append-row "delete-object-with-cascade" {:cascade {:team-ids [team-id]}})

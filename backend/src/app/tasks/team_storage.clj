@@ -12,7 +12,7 @@
   The team-storage consumer of the audit log marks dirty the teams whose
   media may have changed: a loop in its own thread reads the stream from
   its cursor, takes the storage-usage event names and marks their teams
-  in one write per chunk. Every few minutes the `:schedule-team-storage`
+  in one write per chunk. Every few minutes the `:schedule-recompute-team-storage`
   scheduler streams all dirty teams oldest-first and enqueues one
   `:recompute-team-storage` job per team (skipped while one is already
   live), so a failure is contained in its own job and the next tick
@@ -340,31 +340,31 @@
    0
    (db/plan conn [sql:get-dirty-teams] {:fetch-size 100})))
 
-(def schema:schedule-team-storage-params
+(def schema:schedule-recompute-params
   "The scheduler takes no params."
   [:map {:closed true}])
 
-(def schema:recompute-team-storage-params
+(def schema:recompute-params
   "A single team to recompute."
   [:map {:closed true}
    [:team-id ::sm/uuid]])
 
-(defmethod ig/assert-key ::job-def
+(defmethod ig/assert-key ::schedule-recompute-job-def
   [_ params]
   (assert (db/pool? (::db/pool params)) "expected a valid database pool")
   (assert (mtx/metrics? (::mtx/metrics params)) "expected valid metrics instance"))
 
-(defmethod ig/assert-key ::worker-job-def
+(defmethod ig/assert-key ::recompute-job-def
   [_ params]
   (assert (db/pool? (::db/pool params)) "expected a valid database pool")
   (assert (mtx/metrics? (::mtx/metrics params)) "expected valid metrics instance"))
 
-(defmethod ig/init-key ::job-def
+(defmethod ig/init-key ::schedule-recompute-job-def
   [_ cfg]
-  {::jobs/name      :schedule-team-storage
-   ::jobs/schema    schema:schedule-team-storage-params
-   ::jobs/decoder   (sm/decoder schema:schedule-team-storage-params sm/json-transformer)
-   ::jobs/validator (sm/validator schema:schedule-team-storage-params)
+  {::jobs/name      :schedule-recompute-team-storage
+   ::jobs/schema    schema:schedule-recompute-params
+   ::jobs/decoder   (sm/decoder schema:schedule-recompute-params sm/json-transformer)
+   ::jobs/validator (sm/validator schema:schedule-recompute-params)
    ::jobs/handler
    (fn [_context _params]
      ;; Read-only: pgjdbc only honors the plan fetch-size (a real
@@ -374,12 +374,12 @@
      (-> (assoc cfg ::db/read-only true)
          (db/tx-run! execute-schedule)))})
 
-(defmethod ig/init-key ::worker-job-def
+(defmethod ig/init-key ::recompute-job-def
   [_ cfg]
   {::jobs/name      :recompute-team-storage
-   ::jobs/schema    schema:recompute-team-storage-params
-   ::jobs/decoder   (sm/decoder schema:recompute-team-storage-params sm/json-transformer)
-   ::jobs/validator (sm/validator schema:recompute-team-storage-params)
+   ::jobs/schema    schema:recompute-params
+   ::jobs/decoder   (sm/decoder schema:recompute-params sm/json-transformer)
+   ::jobs/validator (sm/validator schema:recompute-params)
    ::jobs/handler
    (fn [_context params]
      (db/tx-run! cfg execute-recompute params))})
