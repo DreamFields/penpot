@@ -1037,7 +1037,8 @@
   "Record the total time of a terminal outcome. Runs after the commit
   that made the job terminal, so a rolled back transition is never
   counted. The histogram `_count` is the terminal total per outcome:
-  no separate counter, and `outcome=\"aborted\"` is the orphan count.
+  no separate counter, and `outcome=\"aborted\"` counts the system-side
+  aborts (an orphan lease or a job lost on its way to the queue).
   The row always carries `created_at` (`NOT NULL` in the table, and every
   caller reads it), so there is no guard: a caller that forgets it fails
   in `db/after-commit`, which logs it. Takes the cfg and resolves the
@@ -1075,16 +1076,15 @@
                     :code :orphan
                     :hint "job execution lease expired"}))
 
-(def superseded-error
-  "Error of a `::jobs/dedupe`/`::jobs/debounce` job whose message was lost
-  on the way to its queue and already has a newer `new` row with the same
-  key. The newer row carries the latest params, so the lost one is marked
-  `aborted` (system-side terminal, never retried) with its `end` event in
-  the same transaction instead of going back to `new`: that would violate
-  `job__new_dedupe__uniq` and abort the whole dispatch batch."
+(def lost-error
+  "Error of a job that was handed to its queue and no worker claimed it
+  within the dispatcher window. The queue message is gone (`scheduled`
+  means pushed), so the job is marked `aborted` (system-side terminal,
+  never retried) with its `end` event in the same transaction instead of
+  going back to `new`."
   (check-job-error {:type :internal
-                    :code :superseded
-                    :hint "superseded by a newer submit for the same dedupe key"}))
+                    :code :lost
+                    :hint "job was not claimed after being scheduled"}))
 
 (def ^:private decode-job-error-value
   (sm/decoder schema:job-error sm/json-transformer))
@@ -1115,9 +1115,9 @@
 
   Only transitions a pending row (new/scheduled/retry) to `running`, and
   requires an exact `scheduled-at` match with the value advertised in the
-  queue payload, so a stale payload (row rescheduled or claimed in the
-  meantime) affects 0 rows and must be skipped. Returns the number of
-  affected rows.
+  queue payload, so a duplicate or stale payload (the row was claimed in
+  the meantime, or is already aborted) affects 0 rows and must be
+  skipped. Returns the number of affected rows.
 
   The event carries `attempt` = `retry_num + 1`: the number of the
   attempt this run consumes from the retry budget."

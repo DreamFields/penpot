@@ -61,50 +61,16 @@
 
 ;; The sweeps are bulk UPDATEs that run before every dispatch batch, so
 ;; they are the queries where a missing tenant filter does the most
-;; damage: without it any instance with a worker requeues another
-;; instance's scheduled rows and, worse, aborts its running jobs once
-;; their lease expires.
-
-;; A deduped job that already has a newer `new` row with its key cannot
-;; go back to `new`: that would put two rows in `job__new_dedupe__uniq`
-;; and abort the batch. `abort-superseded` resolves it; the guard in
-;; `reschedule-lost` covers the race with a submit that lands between the
-;; two statements.
-(def ^:private sql:reschedule-lost
-  "UPDATE job
-      SET status='new', scheduled_at=?::timestamptz
-     FROM (SELECT t.id
-             FROM job AS t
-            WHERE status = 'scheduled'
-              AND t.tenant = ?
-              AND t.scheduled_at < ?::timestamptz - '5 min'::interval
-              AND NOT (t.dedupe AND EXISTS (
-                    SELECT 1 FROM job AS d
-                     WHERE d.tenant = t.tenant
-                       AND d.name = t.name
-                       AND d.queue = t.queue
-                       AND d.label = t.label
-                       AND d.dedupe
-                       AND d.status = 'new'))) AS subquery
-    WHERE job.id=subquery.id
-RETURNING job.id, job.name, job.queue")
-
-(def ^:private sql:abort-superseded
+;; damage: without it any instance with a worker aborts another
+;; instance's jobs.
+(def ^:private sql:abort-lost
   "UPDATE job
       SET status='aborted', modified_at=?::timestamptz, error=?::jsonb
      FROM (SELECT t.id
              FROM job AS t
             WHERE t.status = 'scheduled'
-              AND t.dedupe
               AND t.tenant = ?
-              AND t.scheduled_at < ?::timestamptz - '5 min'::interval
-              AND EXISTS (SELECT 1 FROM job AS d
-                           WHERE d.tenant = t.tenant
-                             AND d.name = t.name
-                             AND d.queue = t.queue
-                             AND d.label = t.label
-                             AND d.dedupe
-                             AND d.status = 'new')) AS subquery
+              AND t.modified_at < ?::timestamptz) AS subquery
     WHERE job.id=subquery.id
 RETURNING job.id, job.queue, job.name, job.created_at")
 
@@ -119,14 +85,20 @@ RETURNING job.id, job.queue, job.name, job.created_at")
     WHERE job.id=subquery.id
 RETURNING job.id, job.queue, job.name, job.created_at")
 
+(def ^:private lost-ttl
+  "How long a row may stay `scheduled` without a worker claiming it before
+  its message is considered lost. `scheduled` means \"handed to the
+  queue\": past this window the job is aborted, never re-dispatched."
+  (ct/duration "1h"))
+
 ;; the error travels as text and PostgreSQL casts it: a PGobject parameter
 ;; on a `::jsonb` placeholder is not what the driver expects here. Same
-;; for the orphan `end` event payload below.
+;; for the `end` event payload below.
 (def ^:private orphan-error-json
   (json/encode jobs/orphan-error))
 
-(def ^:private superseded-error-json
-  (json/encode jobs/superseded-error))
+(def ^:private lost-error-json
+  (json/encode jobs/lost-error))
 
 (def ^:private aborted-outcome-json
   (json/encode {:outcome "aborted"}))
@@ -139,66 +111,57 @@ RETURNING job.id, job.queue, job.name, job.created_at")
   [{:keys [id scheduled-at]}]
   (json/encode [(str id) (ct/format-inst scheduled-at)]))
 
-(defn- abort-superseded-jobs
-  "Abort the deduped jobs whose message was lost and that already have a
-  newer `new` row with the same key. The newer row carries the latest
-  params, so it is the one that does the work; sending the lost one back
-  to `new` would put two rows in `job__new_dedupe__uniq` and abort the
-  batch. The abort owns its `end` events, like the orphan sweep."
-  [{:keys [::db/conn ::timestamp ::wrk/tenant] :as cfg}]
-  (let [rows (db/exec! conn [sql:abort-superseded timestamp superseded-error-json
-                             tenant timestamp]
-                       {:return-keys true})]
-    (when (seq rows)
-      (db/exec-one! conn [sql:insert-aborted-events
-                          (db/create-array conn "uuid" (map :id rows))
-                          aborted-outcome-json]))
-    (db/after-commit
-     (fn []
-       (doseq [{:keys [id queue name created-at]} rows]
-         (metrics/record-total cfg name :aborted
-                               (- (inst-ms timestamp) (inst-ms created-at)))
-         (l/wrn :hint "marked job as aborted (superseded by a newer submit)"
-                :id (str id)
-                :tenant tenant
-                :queue queue))))))
+(defn- record-aborted
+  "The durable side of one abort sweep: the `end` events in the same
+  transaction (one bulk insert, never one per row) and the terminal metric
+  after the commit. No msgbus notification: an aborted job alerts through
+  the error log and `penpot_jobs_total_ms{outcome=\"aborted\"}`."
+  [{:keys [::db/conn ::timestamp] :as cfg} rows]
+  (when (seq rows)
+    (db/exec-one! conn [sql:insert-aborted-events
+                        (db/create-array conn "uuid" (map :id rows))
+                        aborted-outcome-json]))
+  (db/after-commit
+   (fn []
+     (doseq [{:keys [name created-at]} rows]
+       (metrics/record-total cfg name :aborted
+                             (- (inst-ms timestamp) (inst-ms created-at)))))))
 
-(defn- reschedule-lost-jobs
-  [{:keys [::db/conn ::timestamp ::wrk/tenant] :as cfg}]
-  (let [rows (db/exec! conn [sql:reschedule-lost timestamp tenant timestamp]
-                       {:return-keys true})]
+(defn- abort-lost-jobs
+  "Abort the rows that were handed to a queue and never claimed. Their
+  message is gone (Redis lost it, or the worker died before claiming), so
+  the job is terminal: it never goes back to `new`, which keeps the dedupe
+  index out of the dispatcher's path."
+  [cfg]
+  (let [{:keys [::db/conn ::timestamp ::wrk/tenant]} cfg
+        cutoff (ct/minus timestamp lost-ttl)
+        rows   (db/exec! conn [sql:abort-lost timestamp lost-error-json
+                               tenant cutoff]
+                         {:return-keys true})]
+    (record-aborted cfg rows)
     (db/after-commit
      (fn []
-       (doseq [{:keys [id name queue]} rows]
-         (metrics/record-rescheduled cfg name)
-         (l/wrn :hint "reschedule"
+       (doseq [{:keys [id queue name]} rows]
+         (l/wrn :hint "marked job as aborted (never claimed after being scheduled)"
                 :name name
                 :id (str id)
                 :tenant tenant
                 :queue queue))))))
 
 (defn- mark-orphan-jobs
+  "Abort the running jobs whose process stopped reporting: their lease
+  expired, so nothing alive can finish them."
   [{:keys [::db/conn ::timestamp ::lease ::wrk/tenant] :as cfg}]
   (let [cutoff (ct/minus timestamp (or lease (cf/get-jobs-lease)))
         rows    (db/exec! conn [sql:mark-orphan timestamp orphan-error-json
                                 tenant cutoff]
                           {:return-keys true})]
-    ;; The sweep is the only status change outside `app.jobs`, so it owns
-    ;; its `end` events too: one bulk insert in the same transaction (never
-    ;; one insert per orphan) keeps the history consistent with the rows.
-    ;; No msgbus notification: orphans alert through the error log and the
-    ;; `aborted` outcome of `penpot_jobs_total_ms`, whose `_count` is the
-    ;; orphan count.
-    (when (seq rows)
-      (db/exec-one! conn [sql:insert-aborted-events
-                          (db/create-array conn "uuid" (map :id rows))
-                          aborted-outcome-json]))
+    (record-aborted cfg rows)
     (db/after-commit
      (fn []
-       (doseq [{:keys [id queue name created-at]} rows]
-         (metrics/record-total cfg name :aborted
-                               (- (inst-ms timestamp) (inst-ms created-at)))
+       (doseq [{:keys [id queue name]} rows]
          (l/err :hint "marked job as aborted (orphan lease expired)"
+                :name name
                 :id (str id)
                 :tenant tenant
                 :queue queue))))))
@@ -219,8 +182,9 @@ RETURNING job.id, job.queue, job.name, job.created_at")
 (defn- push-jobs
   [{:keys [::rds/conn ::wrk/tenant] :as cfg} [queue jobs]]
   ;; Mark first, push last: a crash between mark and push leaves a
-  ;; `scheduled` row that reschedule-lost-jobs re-queues, while the
-  ;; reverse order leaves a duplicate payload nothing deduplicates.
+  ;; `scheduled` row that the lost sweep aborts after its window, while the
+  ;; reverse order leaves a payload for a row the dispatcher will push
+  ;; again (two deliveries of the same job).
   (mark-as-scheduled cfg jobs)
   (let [items (mapv encode-payload jobs)
         key   (wrk/queue-key tenant queue)]
@@ -238,14 +202,10 @@ RETURNING job.id, job.queue, job.name, job.created_at")
   [cfg]
   (let [cfg    (assoc cfg ::timestamp (ct/now))
         tpoint (ct/tpoint)]
-    ;; The lost deduped jobs that already have a newer pending row are
-    ;; aborted first: they cannot go back to `new` without breaking the
-    ;; dedupe index, and the newer row is the one that does the work.
-    (abort-superseded-jobs cfg)
-
-    ;; Reschedule lost in transit jobs (can happen when
-    ;; redis server is restarted just after job is pushed)
-    (reschedule-lost-jobs cfg)
+    ;; The jobs that were handed to a queue and never claimed are
+    ;; terminal: a lost message is not re-dispatched, so no job ever goes
+    ;; back to `new` and the dedupe index stays out of this path.
+    (abort-lost-jobs cfg)
 
     ;; Mark as aborted all jobs that are still marked as running but
     ;; their last modification (heartbeat or progress) is older than
@@ -272,9 +232,10 @@ RETURNING job.id, job.queue, job.name, job.created_at")
   (px/sleep (or (::timeout cfg) (ct/duration "10s"))))
 
 (defn run-batch
-  "Execute a single dispatch batch: reschedule lost jobs, mark orphans
-  (lease-based) and claim pending jobs into their Redis queues. Exposed
-  as a function for testability; the dispatcher thread loops on it."
+  "Execute a single dispatch batch: abort the lost scheduled jobs, abort
+  the orphans (lease-based) and claim pending jobs into their Redis
+  queues. Exposed as a function for testability; the dispatcher thread
+  loops on it."
   [cfg]
   (let [tpoint (ct/tpoint)
         tenant (::wrk/tenant cfg)]

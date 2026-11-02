@@ -291,12 +291,6 @@
     ::mdef/help "Total number of job events stored."
     ::mdef/type :counter}
 
-   :jobs-rescheduled
-   {::mdef/name "penpot_jobs_rescheduled_total"
-    ::mdef/help "Total number of scheduled jobs recovered after transit loss."
-    ::mdef/labels ["name"]
-    ::mdef/type :counter}
-
    :jobs-claim-wait-timing
    {::mdef/name "penpot_jobs_claim_wait_ms"
     ::mdef/help "Time from job scheduling to worker claim (milliseconds). Its _count counts claims, not pushes: compare with penpot_jobs_dispatched_total."

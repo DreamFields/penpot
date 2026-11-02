@@ -178,93 +178,62 @@
     (t/is (= "new" (:status (get-row future))))
     (t/is (= "running" (:status (get-row running))))))
 
-(t/deftest dispatcher-reschedules-lost-scheduled-jobs
-  (let [cfg      (mk-cfg)
-        lost-id  (mk-job {:status     "scheduled"
-                          :scheduled-at (ct/minus (ct/now)
-                                                  (ct/duration {:minutes 6}))})
-        fresh-id (mk-job {:status "scheduled"})]
-    (wdisp/run-batch cfg)
-    (let [lost  (get-row lost-id)
-          fresh (get-row fresh-id)]
-      ;; the lost job is rescheduled to 'new' and claimed again in the
-      ;; same batch, so it ends as 'scheduled' with a recent scheduled_at
-      (t/is (= "scheduled" (:status lost)))
-      (t/is (> (inst-ms (:scheduled-at lost))
-               (inst-ms (ct/minus (ct/now)
-                                  (ct/duration {:minutes 5})))))
-      (t/testing "the rescheduled job was pushed again to the queue"
-        (t/is (= 1 (count (drain-queue "test"))))
-        (t/is (= "scheduled" (:status fresh)))))))
-
-(t/deftest dispatcher-reschedule-records-the-job-name
-  (let [metrics (ig/init-key :app.metrics/metrics
-                             {:default (select-keys main/default-metrics
-                                                    [:jobs-rescheduled])})
-        cfg     (assoc (mk-cfg) ::mtx/metrics metrics)]
-    (mk-job {:status       "scheduled"
-             :scheduled-at (ct/minus (ct/now)
-                                     (ct/duration {:minutes 6}))})
-    (wdisp/run-batch cfg)
-    (t/testing "the name comes from the RETURNING of the sweep"
-      (t/is (= 1.0 (counter-value metrics :jobs-rescheduled ["test-job"]))))
-    (t/testing "the queue is not a label any more"
-      (t/is (= 0.0 (counter-value metrics :jobs-rescheduled ["test"]))))))
-
-(t/deftest dispatcher-aborts-a-lost-dedupe-job-with-a-newer-submit
-  ;; A lost deduped job cannot go back to `new` when a newer submit already
-  ;; holds its key: two rows in `job__new_dedupe__uniq` abort the whole
-  ;; batch. The newer row carries the latest params, so the lost one is
-  ;; aborted with its end event instead.
-  (let [cfg   (assoc (mk-cfg) ::wdisp/timeout (ct/duration {:millis 0}))
-        lost  (mk-job {:status       "scheduled"
-                       :dedupe       true
-                       :label        "k"
-                       :scheduled-at (ct/minus (ct/now)
-                                               (ct/duration {:minutes 6}))})
-        fresh (mk-job {:status "new" :dedupe true :label "k"})]
-    (wdisp/run-batch cfg)
-    (let [row (get-row lost)]
-      (t/testing "the lost row is terminal, with the structured error"
-        (t/is (= "aborted" (:status row)))
-        (t/is (= jobs/superseded-error (:error row))))
-      (t/testing "the sweep stores the end event with the aborted outcome"
-        (t/is (= [{:kind "end" :payload {:outcome "aborted"}}]
-                 (:events row)))))
-    (t/testing "the newer submit does the work"
-      (t/is (= "scheduled" (:status (get-row fresh))))
-      (t/is (= 1 (count (drain-queue "test")))))))
-
-(t/deftest dispatcher-reschedules-a-lost-dedupe-job-without-a-submit
-  ;; Without a newer row the lost deduped job is the only one that can do
-  ;; the work: it goes back to `new` and is dispatched again, like any
-  ;; other lost job.
+(t/deftest dispatcher-aborts-a-scheduled-job-lost-for-an-hour
+  ;; `scheduled` means the job was handed to a queue. If no worker claims
+  ;; it within the window, the message is gone and the job is terminal.
   (let [cfg  (mk-cfg)
-        lost (mk-job {:status       "scheduled"
-                      :dedupe       true
-                      :label        "k"
-                      :scheduled-at (ct/minus (ct/now)
-                                              (ct/duration {:minutes 6}))})]
+        lost (mk-job {:status      "scheduled"
+                      :modified-at (ct/minus (ct/now)
+                                             (ct/duration {:minutes 61}))})]
     (wdisp/run-batch cfg)
     (let [row (get-row lost)]
+      (t/is (= "aborted" (:status row)))
+      (t/is (= jobs/lost-error (:error row)))
+      (t/is (= [{:kind "end" :payload {:outcome "aborted"}}] (:events row)))
+      (t/testing "an aborted job is terminal: it is never retried"
+        (t/is (zero? (jobs/retry-job cfg (:id row) 1 (ct/now) jobs/lost-error :backoff)))))))
+
+(t/deftest dispatcher-leaves-a-fresh-scheduled-job-alone
+  (let [cfg   (mk-cfg)
+        fresh (mk-job {:status      "scheduled"
+                       :modified-at (ct/minus (ct/now)
+                                              (ct/duration {:minutes 4}))})]
+    (wdisp/run-batch cfg)
+    (let [row (get-row fresh)]
       (t/is (= "scheduled" (:status row)))
       (t/is (nil? (:error row)))
-      (t/is (> (inst-ms (:scheduled-at row))
-               (inst-ms (ct/minus (ct/now)
-                                  (ct/duration {:minutes 5})))))
-      (t/is (= 1 (count (drain-queue "test")))))))
+      (t/is (= [] (:events row))))))
 
-(t/deftest dispatcher-abort-superseded-records-the-terminal-counter
+(t/deftest dispatcher-aborts-two-lost-dedupe-jobs-with-the-same-key
+  ;; A Redis restart loses every message at once: two deduped jobs with the
+  ;; same key can be `scheduled` together. Neither returns to `new` (that
+  ;; would violate `job__new_dedupe__uniq`); both are aborted and the batch
+  ;; keeps going.
+  (let [cfg (mk-cfg)
+        a   (mk-job {:status      "scheduled"
+                     :dedupe      true
+                     :label       "k"
+                     :modified-at (ct/minus (ct/now)
+                                            (ct/duration {:minutes 61}))})
+        b   (mk-job {:status      "scheduled"
+                     :dedupe      true
+                     :label       "k"
+                     :modified-at (ct/minus (ct/now)
+                                            (ct/duration {:minutes 62}))})]
+    (wdisp/run-batch cfg)
+    (t/is (= "aborted" (:status (get-row a))))
+    (t/is (= "aborted" (:status (get-row b))))
+    (t/is (empty? (th/db-query :job {:status "new"})))
+    (t/is (empty? (drain-queue "test")))))
+
+(t/deftest dispatcher-abort-lost-records-the-terminal-counter
   (let [metrics (make-orphan-metrics)
         cfg     (assoc (mk-cfg) ::mtx/metrics metrics)]
-    (mk-job {:status       "scheduled"
-             :dedupe       true
-             :label        "k"
-             :scheduled-at (ct/minus (ct/now)
-                                     (ct/duration {:minutes 6}))})
-    (mk-job {:status "new" :dedupe true :label "k"})
+    (mk-job {:status      "scheduled"
+             :modified-at (ct/minus (ct/now)
+                                    (ct/duration {:minutes 61}))})
     (wdisp/run-batch cfg)
-    (t/testing "the superseded job counts as an aborted terminal outcome"
+    (t/testing "a job lost in transit counts as an aborted terminal outcome"
       (t/is (= 1 (histogram-sample-count metrics ["test-job" "aborted"]))))))
 
 (t/deftest dispatcher-marks-stale-running-jobs-as-aborted-by-lease
@@ -369,19 +338,18 @@
     (t/testing "and nothing was pushed to this tenant's Redis list"
       (t/is (empty? (drain-queue "test"))))))
 
-(t/deftest dispatcher-does-not-reschedule-another-tenants-lost-jobs
+(t/deftest dispatcher-does-not-abort-another-tenants-lost-jobs
   (let [cfg     (mk-cfg)
         foreign (mk-job {:status      "scheduled"
                          :tenant      "other-tenant"
-                         :scheduled-at (ct/minus (ct/now)
-                                                 (ct/duration {:minutes 6}))})]
+                         :modified-at (ct/minus (ct/now)
+                                                (ct/duration {:minutes 61}))})]
     (wdisp/run-batch cfg)
     (t/testing "the other tenant's scheduled job keeps its status and its date"
       (let [row (get-row foreign)]
         (t/is (= "scheduled" (:status row)))
-        (t/is (< (inst-ms (:scheduled-at row))
-                 (inst-ms (ct/minus (ct/now)
-                                    (ct/duration {:minutes 5})))))))))
+        (t/is (nil? (:error row)))
+        (t/is (= [] (:events row)))))))
 
 (t/deftest dispatcher-does-not-orphan-another-tenants-running-jobs
   (let [cfg     (mk-cfg)

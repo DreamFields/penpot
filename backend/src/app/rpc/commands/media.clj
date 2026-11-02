@@ -242,7 +242,8 @@
 
 (sv/defmethod ::create-file-media-object-from-url
   {::doc/added "1.17"
-   ::doc/changes [["2.19" "The optional :id param is rejected with a params-validation error; the server always generates the identifier"]]
+   ::doc/changes [["2.19" "The optional :id param is rejected with a params-validation error; the server always generates the identifier"]
+                  ["2.19" "The upload pays the media-storage-bytes-per-team quota like upload-file-media-object"]]
    ::climit/id [[:process-image/by-profile ::rpc/profile-id]
                 [:process-image/global]]
    ::sm/params schema:create-file-media-object-from-url}
@@ -571,7 +572,8 @@
 
 (sv/defmethod ::assemble-file-media-object
   {::doc/added "2.17"
-   ::doc/changes [["2.19" "The optional :id param is rejected with a params-validation error; the server always generates the identifier"]]
+   ::doc/changes [["2.19" "The optional :id param is rejected with a params-validation error; the server always generates the identifier"]
+                  ["2.19" "The upload pays the media-storage-bytes-per-team quota like upload-file-media-object"]]
    ::sm/params schema:assemble-file-media-object
    ::climit/id [[:process-image/by-profile ::rpc/profile-id]
                 [:process-image/global]]}

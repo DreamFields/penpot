@@ -45,14 +45,16 @@
           ;; One query: the position of every enabled consumer and, in the
           ;; same result, how many of them exist.
           rows (db/exec! cfg
-                         (into [(str "SELECT xid::text AS xid, seq,"
+                         (into [(str "SELECT xid::text AS xid_text, seq,"
                                      "       count(*) OVER () AS total"
                                      "  FROM audit_log_consumer_cursor"
                                      " WHERE consumer IN (" placeholders ")"
-                                     " ORDER BY xid ASC, seq ASC")]
+                                     ;; Qualified on purpose: `xid` alone
+                                     ;; resolves to the text output alias.
+                                     " ORDER BY audit_log_consumer_cursor.xid ASC, seq ASC")]
                                consumer-ids))]
       (when (= (count consumer-ids) (:total (first rows)))
-        (select-keys (first rows) [:xid :seq])))))
+        (select-keys (first rows) [:xid-text :seq])))))
 
 (def ^:private max-xid
   "Any real row sorts before it: used when no consumer is enabled, so
@@ -114,9 +116,9 @@
   (let [consumer-ids (consumers/enabled-consumers)
         cursor       (if (seq consumer-ids)
                        (get-min-cursor cfg consumer-ids)
-                       {:xid max-xid :seq Long/MAX_VALUE})]
+                       {:xid-text max-xid :seq Long/MAX_VALUE})]
     (if-let [cursor cursor]
-      (let [total (delete-batched cfg (:xid cursor) (:seq cursor))]
+      (let [total (delete-batched cfg (:xid-text cursor) (:seq cursor))]
         (when (pos? total)
           (consumers/record-count (mtx/instance cfg) :audit-consumer-discarded ["gc"] total))
         total)

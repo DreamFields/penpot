@@ -126,20 +126,23 @@
   "Lock the position of one consumer for the duration of the chunk.
   The lock is on the cursor row, which takes part in no foreign key:
   two passes of the same consumer serialize here, and no row lock on
-  `audit_log` is needed (the GC never locks the cursor). `xid::text`
-  keeps the value portable: it goes back to SQL as `?::xid8`.
+  `audit_log` is needed (the GC never locks the cursor). The tick mutex
+  is the advisory lock of `with-tick-lock`; this row lock is the safety
+  net for a pass that bypasses the loop (a REPL against a running
+  consumer, for instance).
 
-  The tick mutex is the advisory lock of `with-tick-lock`; this row lock
-  survives for the rolling deploy, where an instance on the previous
-  version (job + row lock) and one on this one (thread + advisory lock)
-  do not know each other and would otherwise read the same chunk twice."
-  "SELECT xid::text AS xid, seq
+  `xid::text` is the JDBC bridge, not a sorting choice: `xid8` is an
+  unsigned 64-bit transaction counter with no Java type and no standard
+  driver mapping, so it crosses as text and goes back to SQL as
+  `?::xid8`. The alias is `xid_text` on purpose: an output column named
+  `xid` would make `ORDER BY xid` sort the text."
+  "SELECT xid::text AS xid_text, seq
      FROM audit_log_consumer_cursor
     WHERE consumer = ?::smallint
       FOR UPDATE")
 
 (def ^:private sql:get-cursor
-  "SELECT xid::text AS xid, seq
+  "SELECT xid::text AS xid_text, seq
      FROM audit_log_consumer_cursor
     WHERE consumer = ?::smallint")
 
@@ -199,11 +202,14 @@
 (def ^:private sql:last-visible
   "The frontier of the pass: the newest row whose transaction is already
   committed, with the same visibility rule the chunk uses. The pass drains
-  up to it, so it always ends and every chunk but the last is full."
-  "SELECT xid::text AS xid, seq
+  up to it, so it always ends and every chunk but the last is full.
+
+  The `ORDER BY` names the table column: `xid` alone would resolve to the
+  text projection (`xid_text`) and sort '999' above '1000'."
+  "SELECT xid::text AS xid_text, seq
      FROM audit_log
     WHERE xid <= pg_snapshot_xmin(pg_current_snapshot())
-    ORDER BY xid DESC, seq DESC
+    ORDER BY audit_log.xid DESC, seq DESC
     LIMIT 1")
 
 (def ^:private sql:advance-cursor
@@ -257,8 +263,8 @@
 (defn- get-chunk-rows
   [cfg cursor watermark]
   (->> (db/exec! cfg [sql:chunk
-                      (:xid cursor) (:seq cursor)
-                      (:xid watermark) (:seq watermark)
+                      (:xid-text cursor) (:seq cursor)
+                      (:xid-text watermark) (:seq watermark)
                       chunk-size])
        (not-empty)))
 
@@ -316,7 +322,7 @@
 (defn- record-lag
   [conn metrics consumer]
   (when-let [cursor (db/exec-one! conn [sql:get-cursor (:id consumer)])]
-    (let [lag (:lag (db/exec-one! conn [sql:lag (:xid cursor) (:seq cursor)]))]
+    (let [lag (:lag (db/exec-one! conn [sql:lag (:xid-text cursor) (:seq cursor)]))]
       (mtx/run! metrics
                 :id :audit-consumer-lag
                 :labels [(consumer-label (:id consumer))]

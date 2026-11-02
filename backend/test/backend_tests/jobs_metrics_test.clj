@@ -30,7 +30,6 @@
   [:jobs-submit
    :jobs-dispatched
    :jobs-retries
-   :jobs-rescheduled
    :jobs-claim-wait-timing
    :jobs-execution-timing
    :jobs-total-timing
@@ -217,7 +216,6 @@
     (jobs-metrics/record-dispatched cfg "delete-object" 2)
     (jobs-metrics/record-total cfg "delete-object" :completed 42)
     (jobs-metrics/record-retry cfg "delete-object" :backoff)
-    (jobs-metrics/record-rescheduled cfg "custom")
     (jobs-metrics/record-gc-rows cfg :expired :deleted 3)
     (jobs-metrics/record-cron cfg :submitted :none)
     (jobs-metrics/record-request cfg :replied 12)
@@ -228,7 +226,6 @@
     (t/is (= 2.0 (counter-value metrics :jobs-dispatched ["delete-object"])))
     (t/is (= 1.0 (histogram-count metrics :jobs-total-timing ["delete-object" "completed"])))
     (t/is (= 1.0 (counter-value metrics :jobs-retries ["delete-object" "backoff"])))
-    (t/is (= 1.0 (counter-value metrics :jobs-rescheduled ["custom"])))
     (t/is (= 3.0 (counter-value metrics :jobs-gc-rows ["expired" "deleted"])))
     (t/is (= 1.0 (counter-value metrics :jobs-cron-total ["submitted" "none"])))
     (t/is (= 1.0 (histogram-count metrics :jobs-request-timing ["replied"])))

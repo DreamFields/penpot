@@ -152,6 +152,33 @@
                   prefix uuid/zero (db/tjson {}) (db/tjson {}) n])
   conn)
 
+(defn- xid-pair-across-a-decimal-boundary
+  "Two xid values below the snapshot cut whose numeric order is the
+  opposite of their text order (1000 sorts before 999 as text), so a
+  text sort cannot produce the right answer by accident."
+  []
+  (let [xmin (Long/parseLong
+              (:xmin (th/db-exec-one!
+                      ["SELECT pg_snapshot_xmin(pg_current_snapshot())::text AS xmin"])))
+        p    (long (Math/pow 10 (Math/floor (Math/log10 (double xmin)))))]
+    (if (< p xmin)
+      [(dec p) p]
+      [(dec (quot p 10)) (quot p 10)])))
+
+(defn- insert-audit-row-at
+  "Insert one audit row at an explicit `(xid, seq)` position: the tests
+  that pin the numeric order of the cursor place rows across a decimal
+  boundary, as a real stream does when the transaction counter grows."
+  [xid seq]
+  (let [id (uuid/next)]
+    (th/db-exec! ["INSERT INTO audit_log (id, name, type, source, profile_id,
+                                          ip_addr, props, context, tracked_at,
+                                          created_at, xid, seq)
+                   VALUES (?, 'create-project', 'action', 'backend', ?,
+                           '127.0.0.1', ?, ?, now(), now(), ?::xid8, ?::bigint)"
+                  id uuid/zero (db/tjson {}) (db/tjson {}) (str xid) seq])
+    id))
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; NEXUS: THE WHOLE STREAM FROM ITS CURSOR
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -1345,3 +1372,60 @@
         (t/is (some? (cursor-of consumer/team-storage)))
         (t/is (= 1 (run-gc)))
         (t/is (= 0 (count (th/db-exec! ["SELECT * FROM audit_log"]))))))))
+
+(t/deftest gc-min-cursor-orders-xid8-numerically
+  ;; The oldest cursor is chosen by the xid8 value, not by its text form:
+  ;; '1000' sorts before '999' as text, and the GC would take the consumer
+  ;; that is ahead and delete rows it has not read.
+  (let [[low high] (xid-pair-across-a-decimal-boundary)]
+    (th/db-exec! ["UPDATE audit_log_consumer_cursor
+                      SET xid = ?::xid8, seq = 7 WHERE consumer = ?::smallint"
+                  (str low) consumer/nexus])
+    (th/db-exec! ["UPDATE audit_log_consumer_cursor
+                      SET xid = ?::xid8, seq = 3 WHERE consumer = ?::smallint"
+                  (str high) consumer/admin-console])
+    (let [cursor (@#'gc/get-min-cursor {::db/pool th/*pool*}
+                                       [consumer/nexus consumer/admin-console])]
+      (t/is (= (str low) (:xid-text cursor)))
+      (t/is (= 7 (:seq cursor))))))
+
+(t/deftest gc-does-not-delete-past-an-unread-cursor
+  ;; Two enabled consumers across a decimal boundary: the GC deletes up to
+  ;; the oldest one. Sorting by text would pick the consumer that is ahead
+  ;; and remove a row it has not read.
+  (let [[low high] (xid-pair-across-a-decimal-boundary)]
+    (th/db-exec! ["UPDATE audit_log_consumer_cursor
+                      SET xid = ?::xid8, seq = 10 WHERE consumer = ?::smallint"
+                  (str low) consumer/nexus])
+    (th/db-exec! ["UPDATE audit_log_consumer_cursor
+                      SET xid = ?::xid8, seq = 10 WHERE consumer = ?::smallint"
+                  (str high) consumer/admin-console])
+    (insert-audit-row-at high 1)
+    (with-redefs [cf/flags #{:nexus :admin-console}]
+      (t/is (= 0 (run-gc)))
+      (t/is (= 1 (count (th/db-exec! ["SELECT * FROM audit_log"])))))))
+
+(t/deftest gc-deletes-the-whole-buffer-with-no-consumer-enabled
+  ;; With no consumer enabled nothing reads the buffer: the GC is the only
+  ;; bound, so it cleans every non-telemetry row and leaves the shadows for
+  ;; the telemetry task.
+  (with-redefs [cf/flags #{}]
+    (insert-audit-row uuid/zero "create-project")
+    (insert-audit-row uuid/zero "create-file")
+    (insert-audit-row uuid/zero "create-project" {} "telemetry:backend")
+    (t/is (= 2 (run-gc)))
+    (let [rows (th/db-exec! ["SELECT source FROM audit_log"])]
+      (t/is (= ["telemetry:backend"] (mapv :source rows))))))
+
+(t/deftest consumer-frontier-uses-the-numeric-max
+  ;; The frontier is the newest visible row, compared as xid8 and not as
+  ;; its text form: '999' sorts above '1000' as text, so a text ORDER BY
+  ;; stops the pass one row early and leaves the newest row invisible.
+  (let [[low high] (xid-pair-across-a-decimal-boundary)]
+    (with-redefs [cf/flags #{:nexus}]
+      (with-mocks [http-mock {:target 'app.http.client/req :return {:status 204}}]
+        (insert-audit-row-at low 1)
+        (insert-audit-row-at high 1)
+        (run-nexus {:uri archive-uri})
+        (t/is (= 2 (count (sent-event-names http-mock))))
+        (t/is (= (str high) (:xid (cursor-of consumer/nexus))))))))

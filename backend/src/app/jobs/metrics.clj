@@ -96,12 +96,6 @@
   [cfg]
   (record-count (mtx/instance cfg) :jobs-events-total [] 1))
 
-(defn record-rescheduled
-  [cfg name]
-  (record-count (mtx/instance cfg) :jobs-rescheduled
-                [(name-label name)]
-                1))
-
 (defn record-claim-wait
   "How late a claim happened: `now - scheduled_at` at the moment the
   runner takes the job, including the gap the dispatcher added. It is not
