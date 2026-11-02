@@ -159,8 +159,12 @@
    ON CONFLICT (consumer) DO NOTHING")
 
 (defn ensure-cursor
-  "Create the cursor of a consumer when it does not exist yet: at the
-  end of the buffer, or at zero when the buffer is empty. Only the
+  "Create the cursor of a consumer when it does not exist yet: at the end
+  of the buffer, or at zero when the buffer is empty. The end is the last
+  committed row: a transaction that was open at that instant and commits
+  afterwards keeps a lower `(xid, seq)`, so it is history for this
+  consumer. The snapshot cut is not applied here on purpose: starting at
+  the cut would replay the rows already committed above it. Only the
   drain calls this; the GC treats a missing cursor as position 0 and
   waits for the consumer to create it."
   [cfg consumer]

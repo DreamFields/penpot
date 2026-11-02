@@ -113,8 +113,9 @@
           ;; away with their files.
           (let [sp (db/savepoint conn "absorb-library")]
             (try
-              ;; The relations must still exist at this point: removing
-              ;; them first is what lets a later hard delete proceed.
+              ;; The relations still exist here (the RPC no longer removes
+              ;; them); dropping them now is what lets the later hard
+              ;; delete cascade them away with their files.
               (db/delete! conn :file-library-rel {:library-file-id id})
               (files/absorb-library cfg id :file-ids dependents)
               (catch Throwable cause

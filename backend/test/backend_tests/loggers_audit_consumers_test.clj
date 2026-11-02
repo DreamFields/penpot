@@ -1212,6 +1212,20 @@
                         ["SELECT count(*) AS cnt FROM team_storage_usage
                           WHERE dirty_at IS NOT NULL"]))))))
 
+(t/deftest storage-usage-chunk-counts-an-invalid-team-id-as-skipped
+  ;; An event whose team id is not a UUID is logged and skipped, so the
+  ;; chunk counts it as skipped: `processed + skipped` is the chunk size.
+  (let [prof (th/create-profile* 89 {:is-active true})
+        team (:default-team-id prof)]
+    (with-redefs [cf/flags team-storage-flags]
+      (append-storage-event "upload-file-media-object" {:team-id "not-a-uuid"})
+      (append-storage-event "upload-file-media-object" {:team-id team})
+      (let [rows (th/db-exec! ["SELECT * FROM audit_log ORDER BY seq"])
+            res  (db/tx-run! {::db/pool th/*pool*}
+                             (fn [cfg]
+                               (#'consumer.team-storage/process-chunk cfg rows)))]
+        (t/is (= {:processed 1 :skipped 1} res))))))
+
 (t/deftest storage-usage-drain-skips-invalid-team-id
   ;; One bad row cannot wedge the queue: the event is logged and
   ;; skipped, the chunk completes, and the valid teams still mark.

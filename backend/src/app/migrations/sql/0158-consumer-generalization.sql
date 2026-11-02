@@ -182,6 +182,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS job__new_dedupe__uniq
     WHERE dedupe
       AND status = 'new';
 
+-- The lost sweep looks for `scheduled` rows by their hand-off time
+-- (`modified_at`), not by their due time: the old index served the removed
+-- reschedule and only narrows by tenant now. The `job` table is not in
+-- production yet, so the rebuild does not need CONCURRENTLY.
+DROP INDEX IF EXISTS job__scheduled__idx;
+
+CREATE INDEX IF NOT EXISTS job__scheduled__idx
+    ON job (tenant, modified_at)
+ WHERE status = 'scheduled';
+
 -- ---------------------------------------------------------------------
 -- NOTE: on an instance with a large `job` or `audit_log` table, apply this
 -- migration out of band before deploying. The runner executes all pending
@@ -214,9 +224,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS job__new_dedupe__uniq
 --    step the buffer is only the backlog that was never archived, so the
 --    replay seeded below does not re-send anything already sent.
 --
--- 1. Team storage: a new table, nothing to lock (copy of the block above,
---    both indexes included: the one on `dirty_at` and the partial one on
---    `updated_at` that serves the weekly self-healing sweep).
+-- 1. Team storage: a new table (copy of the block above, both indexes
+--    included: the one on `dirty_at` and the partial one on `updated_at`
+--    that serves the weekly self-healing sweep). The `REFERENCES team(id)`
+--    takes SHARE ROW EXCLUSIVE on `team`, which blocks team writes until
+--    the commit: one more reason to apply this step out of band, and
+--    before the rest of the migration.
 --
 -- 2. Audit log: columns first (metadata-only), the reserved low range and
 --    the defaults the previous version needs immediately:
@@ -264,6 +277,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS job__new_dedupe__uniq
 --      CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS job__new_dedupe__uniq
 --          ON job (tenant, name, queue, label)
 --          WHERE dedupe AND status = 'new';
+--
+--    The lost sweep index changes shape: it filters by `modified_at`, not
+--    by `scheduled_at`. `job` is not in production yet, so a plain rebuild
+--    is enough:
+--
+--      DROP INDEX IF EXISTS job__scheduled__idx;
+--      CREATE INDEX IF NOT EXISTS job__scheduled__idx
+--          ON job (tenant, modified_at)
+--       WHERE status = 'scheduled';
 --
 -- Lock hygiene: every ALTER waits for ACCESS EXCLUSIVE, so run each one with
 -- `SET lock_timeout = '5s'` and retry instead of letting it queue behind a

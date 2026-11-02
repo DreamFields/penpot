@@ -222,10 +222,16 @@
       (t/is (not (str/includes? def "(tenant, queue"))))))
 
 (t/deftest job-sweep-indexes-are-tenant-scoped
+  ;; The test database already ran 0158 in its old shape: re-apply it so the
+  ;; lost-sweep index exists with the current definition.
+  (th/db-exec! ["DROP INDEX IF EXISTS job__scheduled__idx"])
+  (let [apply! (mg/resource "app/migrations/sql/0158-consumer-generalization.sql")]
+    (t/is (true? (apply! th/*pool*))))
   (t/testing "orphan sweep"
     (t/is (str/includes? (indexdef "job__orphan__idx") "(tenant, modified_at)")))
-  (t/testing "reschedule of lost scheduled rows"
-    (t/is (str/includes? (indexdef "job__scheduled__idx") "(tenant, scheduled_at)")))
+  (t/testing "lost sweep: it filters by the hand-off time"
+    (t/is (str/includes? (indexdef "job__scheduled__idx") "(tenant, modified_at)"))
+    (t/is (not (str/includes? (indexdef "job__scheduled__idx") "(tenant, scheduled_at)"))))
   (t/testing "cron no-overlap check"
     (t/is (str/includes? (indexdef "job__name_label__idx") "(tenant, name, queue, label)"))))
 

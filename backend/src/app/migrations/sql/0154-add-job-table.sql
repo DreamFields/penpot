@@ -19,7 +19,7 @@
 -- database and the tenant is what keeps them from claiming each other's work:
 -- as an equality the filter is something an index can serve, where a
 -- `<tenant>:<queue>` prefix could only be matched with a LIKE over text. Every
--- query that acts on one instance's work (dispatch, orphan sweep, reschedule,
+-- query that acts on one instance's work (dispatch, lost sweep, orphan sweep,
 -- cron no-overlap check) filters on `tenant` for that reason, and the tenant
 -- leads the keys of the submit dedupe and exclusivity indexes (see the
 -- consumer-generalization migration).
@@ -100,8 +100,9 @@ CREATE INDEX job__resource__idx
     ON job (resource_id)
     WHERE resource_id IS NOT NULL;
 
--- Dispatcher recovery: it finds the `scheduled` jobs of its own tenant
--- that were pushed to Redis but not claimed within the recovery window.
+-- Dispatcher recovery: it finds the `scheduled` jobs of its own tenant.
+-- `0158-consumer-generalization` rebuilds it on `modified_at` (the hand-off
+-- time), which is the column the lost sweep filters by.
 CREATE INDEX job__scheduled__idx
     ON job (tenant, scheduled_at)
     WHERE status = 'scheduled';

@@ -63,18 +63,31 @@
 ;; they are the queries where a missing tenant filter does the most
 ;; damage: without it any instance with a worker aborts another
 ;; instance's jobs.
+(def ^:private sql:lost-candidates
+  "The `scheduled` rows of one tenant that have been waiting longer than
+  the grace. `modified_at` is the hand-off time (the push), so it measures
+  time in the queue, not the due time."
+  "SELECT id, queue, modified_at
+     FROM job
+    WHERE status = 'scheduled'
+      AND tenant = ?
+      AND modified_at < ?::timestamptz")
+
 (def ^:private sql:abort-lost
+  "Abort the lost rows by id. The status and the tenant are repeated in
+  the outer WHERE so a row claimed (or aborted by another dispatcher)
+  between the candidate read and this UPDATE affects no row."
   "UPDATE job
       SET status='aborted', modified_at=?::timestamptz, error=?::jsonb
-     FROM (SELECT t.id
-             FROM job AS t
-            WHERE t.status = 'scheduled'
-              AND t.tenant = ?
-              AND t.modified_at < ?::timestamptz) AS subquery
-    WHERE job.id=subquery.id
+    WHERE id = ANY(?)
+      AND status = 'scheduled'
+      AND tenant = ?
 RETURNING job.id, job.queue, job.name, job.created_at")
 
 (def ^:private sql:mark-orphan
+  "Abort the running rows past the lease. The predicate is repeated in the
+  outer WHERE so a heartbeat that renews the row between the subquery and
+  the update affects no row."
   "UPDATE job
       SET status='aborted', modified_at=?::timestamptz, error=?::jsonb
      FROM (SELECT t.id
@@ -83,13 +96,19 @@ RETURNING job.id, job.queue, job.name, job.created_at")
               AND t.tenant = ?
               AND t.modified_at < ?::timestamptz) AS subquery
     WHERE job.id=subquery.id
+      AND job.status = 'running'
+      AND job.modified_at < ?::timestamptz
 RETURNING job.id, job.queue, job.name, job.created_at")
 
-(def ^:private lost-ttl
-  "How long a row may stay `scheduled` without a worker claiming it before
-  its message is considered lost. `scheduled` means \"handed to the
-  queue\": past this window the job is aborted, never re-dispatched."
-  (ct/duration "1h"))
+(def ^:private lost-grace
+  "How long a `scheduled` row may wait before its queue is inspected.
+  Covers the gap between a worker popping a message and claiming the row."
+  (ct/duration "5m"))
+
+(def ^:private lost-cap
+  "Beyond this age a `scheduled` row is aborted even if its queue still has
+  messages: the job is lost behind a backlog, or its queue has no consumer."
+  (ct/duration "24h"))
 
 ;; the error travels as text and PostgreSQL casts it: a PGobject parameter
 ;; on a `::jsonb` placeholder is not what the driver expects here. Same
@@ -127,26 +146,48 @@ RETURNING job.id, job.queue, job.name, job.created_at")
        (metrics/record-total cfg name :aborted
                              (- (inst-ms timestamp) (inst-ms created-at)))))))
 
+(defn- get-waiting
+  "Messages waiting in each of the given queues, one LLEN per queue."
+  [{:keys [::rds/conn ::wrk/tenant]} queues]
+  (into {}
+        (map (fn [queue]
+               [queue (rds/llen conn (wrk/queue-key tenant queue))]))
+        queues))
+
 (defn- abort-lost-jobs
-  "Abort the rows that were handed to a queue and never claimed. Their
-  message is gone (Redis lost it, or the worker died before claiming), so
-  the job is terminal: it never goes back to `new`, which keeps the dedupe
-  index out of the dispatcher's path."
+  "Abort the rows that were handed to a queue and never claimed. A row is
+  lost when its queue has nothing waiting and it has been `scheduled`
+  longer than the grace (a worker that popped it died before claiming), or
+  when it has been `scheduled` past the cap (lost behind a backlog, or a
+  queue without a consumer). Lost rows are never re-dispatched: nothing
+  returns to `new`, which keeps the dedupe index out of this path."
   [cfg]
   (let [{:keys [::db/conn ::timestamp ::wrk/tenant]} cfg
-        cutoff (ct/minus timestamp lost-ttl)
-        rows   (db/exec! conn [sql:abort-lost timestamp lost-error-json
-                               tenant cutoff]
-                         {:return-keys true})]
-    (record-aborted cfg rows)
-    (db/after-commit
-     (fn []
-       (doseq [{:keys [id queue name]} rows]
-         (l/wrn :hint "marked job as aborted (never claimed after being scheduled)"
-                :name name
-                :id (str id)
-                :tenant tenant
-                :queue queue))))))
+        grace   (ct/minus timestamp lost-grace)
+        cap     (ct/minus timestamp lost-cap)
+        rows    (db/exec! conn [sql:lost-candidates tenant grace])
+        waiting (get-waiting cfg (into #{} (map :queue) rows))
+        lost    (into []
+                      (filter (fn [{:keys [queue modified-at]}]
+                                (or (< (inst-ms modified-at) (inst-ms cap))
+                                    (zero? (get waiting queue)))))
+                      rows)]
+    (when (seq lost)
+      (let [aborted (db/exec! conn [sql:abort-lost
+                                    timestamp
+                                    lost-error-json
+                                    (db/create-array conn "uuid" (map :id lost))
+                                    tenant]
+                              {:return-keys true})]
+        (record-aborted cfg aborted)
+        (db/after-commit
+         (fn []
+           (doseq [{:keys [id queue name]} aborted]
+             (l/wrn :hint "marked job as aborted (never claimed after being scheduled)"
+                    :name name
+                    :id (str id)
+                    :tenant tenant
+                    :queue queue))))))))
 
 (defn- mark-orphan-jobs
   "Abort the running jobs whose process stopped reporting: their lease
@@ -154,7 +195,7 @@ RETURNING job.id, job.queue, job.name, job.created_at")
   [{:keys [::db/conn ::timestamp ::lease ::wrk/tenant] :as cfg}]
   (let [cutoff (ct/minus timestamp (or lease (cf/get-jobs-lease)))
         rows    (db/exec! conn [sql:mark-orphan timestamp orphan-error-json
-                                tenant cutoff]
+                                tenant cutoff cutoff]
                           {:return-keys true})]
     (record-aborted cfg rows)
     (db/after-commit

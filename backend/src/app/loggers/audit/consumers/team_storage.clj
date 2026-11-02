@@ -107,27 +107,27 @@
     (boolean (some #(some? (get props %)) keys))))
 
 (defn- collect-team-ids
-  "Team ids whose media storage may have changed in these events, read
-  straight from props: producers key their events by team so the drain
-  never joins production tables. The callers pass only events whose name
-  is in `event-names`; the `default-team-keys` fallback exists for a
-  direct call, not for the drain. A present non-UUID is a producer bug
-  (see team-ids-of-event, never coerced): that event is logged with its
-  row id and skipped, so one bad row cannot wedge the queue."
+  "Team ids whose media storage may have changed in these events, and how
+  many events carried an invalid one. Read straight from props: producers
+  key their events by team so the drain never joins production tables. The
+  callers pass only events whose name is in `event-names`; the
+  `default-team-keys` fallback exists for a direct call, not for the
+  drain. A present non-UUID is a producer bug (see team-ids-of-event,
+  never coerced): that event is logged with its row id and skipped, so one
+  bad row cannot wedge the queue, and it is reported as `:invalid` so the
+  chunk can count it as skipped."
   [events]
-  (into #{}
-        (comp (map (fn [{:keys [id] :as event}]
-                     (try
-                       (team-ids-of-event event)
-                       (catch Throwable cause
-                         (l/warn :hint "skipping storage-usage event with invalid team ids"
-                                 :audit-log-id (str id)
-                                 :event (:name event)
-                                 :cause cause)
-                         nil))))
-              (mapcat (fn [ids] (or ids [])))
-              (filter some?))
-        events))
+  (reduce (fn [acc {:keys [id] :as event}]
+            (try
+              (update acc :team-ids into (filter some? (team-ids-of-event event)))
+              (catch Throwable cause
+                (l/warn :hint "skipping storage-usage event with invalid team ids"
+                        :audit-log-id (str id)
+                        :event (:name event)
+                        :cause cause)
+                (update acc :invalid inc))))
+          {:team-ids #{} :invalid 0}
+          events))
 
 (def ^:private sql:mark-team-storage-dirty
   "INSERT INTO team_storage_usage AS tsu (team_id, dirty_at)
@@ -164,11 +164,12 @@
                              (assoc (consumers/row->event (consumers/decode-row row))
                                     :id (:id row)))))
                      rows)
-        teams  (collect-team-ids events)]
-    (mark-dirty (::db/conn cfg) teams)
+        {:keys [team-ids invalid]} (collect-team-ids events)
+        processed (- (count events) invalid)]
+    (mark-dirty (::db/conn cfg) team-ids)
     (l/trc :hint "storage-usage teams marked dirty"
            :events (count events)
-           :teams (count teams))
+           :teams (count team-ids))
     ;; No relevant event carries any team key: a producer stopped keying
     ;; its events. An explicit empty collection does not count (see
     ;; carries-team-keys?).
@@ -177,8 +178,8 @@
       (l/warn :hint "storage-usage chunk resolved no team ids"
               :events (count events)
               :ids (mapv (comp str :id) events)))
-    {:processed (count events)
-     :skipped   (- total (count events))}))
+    {:processed processed
+     :skipped   (- total processed)}))
 
 (defn run-pass
   "One pass of the team-storage consumer: read the stream from its cursor

@@ -34,7 +34,7 @@ Worker-enabled, writable backends publish unified jobs metrics through the norma
 
 ## Draining one instance
 
-Each backend has a per-process availability flag (`app.health`, a global atom). While offline, `/readyz` answers `503 OFFLINE` without querying the database, so the load balancer removes that instance from rotation while requests in flight still finish. Operator surface: `app.srepl.main/set-offline` / `set-online`; a restart comes back online. In-flight worker jobs are safe: jobs claimed as `scheduled` return to `new` after the reschedule window and another instance picks them up.
+Each backend has a per-process availability flag (`app.health`, a global atom). While offline, `/readyz` answers `503 OFFLINE` without querying the database, so the load balancer removes that instance from rotation while requests in flight still finish. Operator surface: `app.srepl.main/set-offline` / `set-online`; a restart comes back online. In-flight worker jobs are safe: a job handed to a queue (`scheduled`) that no worker claims within the lost window is aborted with `:lost` (never re-dispatched), and a `running` job whose lease expires is aborted with `:orphan`; neither is retried by the sweep.
 
 ## Touching production data
 

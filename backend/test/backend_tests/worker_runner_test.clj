@@ -408,11 +408,12 @@
       (t/is (= 1 (#'wrkr/claim-job (mk-cfg {}) job-id at)))
       (t/is (= "running" (:status (get-row job-id)))))))
 
-(t/deftest runner-skips-stale-payload-after-reschedule
+(t/deftest runner-skips-a-payload-with-a-stale-timestamp
   (let [stale-at (ct/truncate (ct/now) :millisecond)
         job-id   (mk-job {:scheduled-at stale-at})
         fresh-at (ct/plus stale-at (ct/duration {:minutes 6}))]
-    ;; dispatcher reschedules: new scheduled_at + fresh payload
+    ;; A duplicate payload (or one whose row was edited by hand) carries a
+    ;; timestamp that no longer matches the row.
     (th/db-update! :job {:status "scheduled" :scheduled-at fresh-at} {:id job-id})
 
     (t/testing "stale payload is skipped, handler never invoked"

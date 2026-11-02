@@ -125,6 +125,16 @@
 
 (t/use-fixtures :each test-fixture)
 
+(defn- fill-queue
+  "Put one dummy payload in a queue, as a worker that has not drained it."
+  [queue-name]
+  (let [conn (rds/connect (mk-cfg))]
+    (try
+      (rds/rpush conn (queue-key queue-name)
+                 [(json/encode [(str (uuid/next)) (ct/format-inst (ct/now))])])
+      (finally
+        (rds/close conn)))))
+
 (defn- drain-queue
   [queue-name]
   (let [conn (rds/connect (mk-cfg))]
@@ -178,13 +188,14 @@
     (t/is (= "new" (:status (get-row future))))
     (t/is (= "running" (:status (get-row running))))))
 
-(t/deftest dispatcher-aborts-a-scheduled-job-lost-for-an-hour
-  ;; `scheduled` means the job was handed to a queue. If no worker claims
-  ;; it within the window, the message is gone and the job is terminal.
+(t/deftest dispatcher-aborts-a-lost-job-whose-queue-is-empty
+  ;; `scheduled` means the job was handed to a queue. When the queue has
+  ;; nothing waiting and the row has been there longer than the grace, the
+  ;; message is gone and the job is terminal.
   (let [cfg  (mk-cfg)
         lost (mk-job {:status      "scheduled"
                       :modified-at (ct/minus (ct/now)
-                                             (ct/duration {:minutes 61}))})]
+                                             (ct/duration {:minutes 6}))})]
     (wdisp/run-batch cfg)
     (let [row (get-row lost)]
       (t/is (= "aborted" (:status row)))
@@ -204,6 +215,31 @@
       (t/is (nil? (:error row)))
       (t/is (= [] (:events row))))))
 
+(t/deftest dispatcher-leaves-a-scheduled-job-that-is-still-in-its-queue
+  ;; The queue has a message waiting: the job may be behind a backlog, so
+  ;; it is not lost. Aborting on time alone would kill legitimate work.
+  (let [cfg  (mk-cfg)
+        lost (mk-job {:status      "scheduled"
+                      :modified-at (ct/minus (ct/now)
+                                             (ct/duration {:minutes 6}))})]
+    (fill-queue "test")
+    (wdisp/run-batch cfg)
+    (let [row (get-row lost)]
+      (t/is (= "scheduled" (:status row)))
+      (t/is (nil? (:error row)))
+      (t/is (= [] (:events row))))))
+
+(t/deftest dispatcher-aborts-a-scheduled-job-past-the-cap
+  ;; A message lost behind a backlog (or a queue with no consumer) never
+  ;; drains: past the cap the job is aborted anyway.
+  (let [cfg  (mk-cfg)
+        lost (mk-job {:status      "scheduled"
+                      :modified-at (ct/minus (ct/now)
+                                             (ct/duration {:hours 25}))})]
+    (fill-queue "test")
+    (wdisp/run-batch cfg)
+    (t/is (= "aborted" (:status (get-row lost))))))
+
 (t/deftest dispatcher-aborts-two-lost-dedupe-jobs-with-the-same-key
   ;; A Redis restart loses every message at once: two deduped jobs with the
   ;; same key can be `scheduled` together. Neither returns to `new` (that
@@ -214,12 +250,12 @@
                      :dedupe      true
                      :label       "k"
                      :modified-at (ct/minus (ct/now)
-                                            (ct/duration {:minutes 61}))})
+                                            (ct/duration {:minutes 6}))})
         b   (mk-job {:status      "scheduled"
                      :dedupe      true
                      :label       "k"
                      :modified-at (ct/minus (ct/now)
-                                            (ct/duration {:minutes 62}))})]
+                                            (ct/duration {:minutes 7}))})]
     (wdisp/run-batch cfg)
     (t/is (= "aborted" (:status (get-row a))))
     (t/is (= "aborted" (:status (get-row b))))
@@ -231,10 +267,43 @@
         cfg     (assoc (mk-cfg) ::mtx/metrics metrics)]
     (mk-job {:status      "scheduled"
              :modified-at (ct/minus (ct/now)
-                                    (ct/duration {:minutes 61}))})
+                                    (ct/duration {:minutes 6}))})
     (wdisp/run-batch cfg)
     (t/testing "a job lost in transit counts as an aborted terminal outcome"
       (t/is (= 1 (histogram-sample-count metrics ["test-job" "aborted"]))))))
+
+(t/deftest dispatcher-does-not-abort-a-job-claimed-before-the-sweep
+  ;; The candidate is read first and the UPDATE runs later: a runner can
+  ;; claim the row in between. The outer WHERE must see the new status and
+  ;; affect no row, or the job would be aborted while running.
+  (let [cfg  (mk-cfg)
+        lost (mk-job {:status      "scheduled"
+                      :modified-at (ct/minus (ct/now)
+                                             (ct/duration {:minutes 6}))})]
+    (with-redefs [rds/llen (fn [_ _]
+                             (th/db-update! :job {:status "running"
+                                                  :modified-at (ct/now)}
+                                            {:id lost})
+                             0)]
+      (wdisp/run-batch cfg))
+    (let [row (get-row lost)]
+      (t/is (= "running" (:status row)))
+      (t/is (nil? (:error row)))
+      (t/is (= [] (:events row))))))
+
+(t/deftest dispatcher-aborts-a-lost-job-once
+  ;; Two dispatchers of the same tenant read the same candidate: only the
+  ;; first transition wins, so there is one end event and one sample.
+  (let [metrics (make-orphan-metrics)
+        cfg     (assoc (mk-cfg) ::mtx/metrics metrics)
+        lost    (mk-job {:status      "scheduled"
+                         :modified-at (ct/minus (ct/now)
+                                                (ct/duration {:minutes 6}))})]
+    (run! deref (doall (repeatedly 2 #(future (wdisp/run-batch cfg)))))
+    (t/is (= "aborted" (:status (get-row lost))))
+    (t/is (= 1 (count (filter #(= "end" (:kind %))
+                              (:events (get-row lost))))))
+    (t/is (= 1 (histogram-sample-count metrics ["test-job" "aborted"])))))
 
 (t/deftest dispatcher-marks-stale-running-jobs-as-aborted-by-lease
   (let [cfg    (mk-cfg)
