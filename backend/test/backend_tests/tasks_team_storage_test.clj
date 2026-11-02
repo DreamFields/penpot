@@ -396,10 +396,9 @@
         (t/is (= 12 (count rows)))
         (t/is (= {0 5, 5000 5, 10000 2} (frequencies (map :delay-ms rows))))))))
 
-(t/deftest storage-usage-scheduler-partial-progress-survives-mid-run-failure
-  ;; Chunks commit independently: a failure mid-run keeps the chunks
-  ;; already enqueued, and the next tick only submits the rest
-  ;; (the live ones are skipped).
+(t/deftest storage-usage-scheduler-failure-rolls-back-the-run
+  ;; The whole schedule is one transaction: a failure mid-run leaves no
+  ;; job behind, and the next tick submits every team again.
   (let [teams (mapv #(:default-team-id (th/create-profile* %)) (range 120 132))]
     (with-redefs [cf/flags test-flags
                   team-storage/scheduler-chunk-size 5]
@@ -414,11 +413,10 @@
                                                      (throw (ex-info "boom" {})))
                                                    (orig cfg opts))]
                          (th/run-task! :schedule-recompute-team-storage {}))))
-        ;; The first chunk committed before the failure; the second
-        ;; rolled back whole.
-        (t/is (= 5 (count (th/db-query :job {:name "recompute-team-storage"}))))
-        ;; The next tick resumes: 5 live skipped, 7 fresh.
-        (t/is (= 7 (th/run-task! :schedule-recompute-team-storage {})))
+        ;; Everything rolled back with the run.
+        (t/is (= 0 (count (th/db-query :job {:name "recompute-team-storage"}))))
+        ;; The next tick starts over and enqueues all of them.
+        (t/is (= 12 (th/run-task! :schedule-recompute-team-storage {})))
         (t/is (= 12 (count (th/db-query :job {:name "recompute-team-storage"}))))))))
 
 (t/deftest audit-submit-does-not-swallow-failures

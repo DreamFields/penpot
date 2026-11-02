@@ -191,7 +191,11 @@
 (t/deftest dispatcher-aborts-a-lost-job-whose-queue-is-empty
   ;; `scheduled` means the job was handed to a queue. When the queue has
   ;; nothing waiting and the row has been there longer than the grace, the
-  ;; message is gone and the job is terminal.
+  ;; message is gone and the job is terminal. Known limit: the grace is
+  ;; measured from the push, so a message that waited longer in a backlog
+  ;; and is popped while the sweep runs (the queue empty at that instant)
+  ;; can lose the race with its claim; the window is the worker's
+  ;; pop-to-claim round trip.
   (let [cfg  (mk-cfg)
         lost (mk-job {:status      "scheduled"
                       :modified-at (ct/minus (ct/now)
@@ -239,6 +243,41 @@
     (fill-queue "test")
     (wdisp/run-batch cfg)
     (t/is (= "aborted" (:status (get-row lost))))))
+
+(t/deftest dispatcher-does-not-abort-a-job-whose-heartbeat-renews-it
+  ;; The heartbeat accepts a `scheduled` row (a previous attempt may still
+  ;; beat): it refreshes `modified_at`, so the outer WHERE must re-check it.
+  (let [cfg  (mk-cfg)
+        lost (mk-job {:status      "scheduled"
+                      :modified-at (ct/minus (ct/now)
+                                             (ct/duration {:minutes 6}))})]
+    (with-redefs [rds/llen (fn [_ _]
+                             (th/db-update! :job {:modified-at (ct/now)} {:id lost})
+                             0)]
+      (wdisp/run-batch cfg))
+    (let [row (get-row lost)]
+      (t/is (= "scheduled" (:status row)))
+      (t/is (nil? (:error row)))
+      (t/is (= [] (:events row))))))
+
+(t/deftest dispatcher-llens-only-its-tenant-queue
+  ;; The queue key carries the tenant: a message waiting for another
+  ;; environment cannot protect a lost row of this one.
+  (let [cfg     (mk-cfg)
+        foreign (wrk/queue-key "other-tenant" "test")
+        conn    (rds/connect (mk-cfg))
+        lost    (mk-job {:status      "scheduled"
+                         :modified-at (ct/minus (ct/now)
+                                                (ct/duration {:minutes 6}))})]
+    (try
+      (rds/rpush conn foreign
+                 [(json/encode [(str (uuid/next))
+                                (ct/format-inst (ct/now))])])
+      (wdisp/run-batch cfg)
+      (t/is (= "aborted" (:status (get-row lost))))
+      (finally
+        (rds/del conn foreign)
+        (rds/close conn)))))
 
 (t/deftest dispatcher-aborts-two-lost-dedupe-jobs-with-the-same-key
   ;; A Redis restart loses every message at once: two deduped jobs with the

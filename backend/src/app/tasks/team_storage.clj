@@ -84,8 +84,8 @@
     bytes))
 
 (def ^:private scheduler-chunk-size
-  "Teams per scheduler transaction: each chunk commits on its own so
-  killing the job mid-run keeps the chunks already enqueued."
+  "Teams per enqueue batch: it bounds the delay bucket (`chunk-delay`)
+  and the work between two heartbeats, not the transaction."
   50)
 
 (def ^:private scheduler-delay-step-ms 5000)
@@ -100,10 +100,8 @@
 
 (defn- submit-team-chunk
   "Enqueue one recompute job per team id in the caller transaction and
-  answer how many were enqueued: call it through `tx-run!` on a cfg
-  without `::db/conn` (see `db/own-transaction`) so the chunk commits
-  (or rolls back) whole. A nil submit means skip-if-active found a live
-  job for that team: nothing enqueued, not counted."
+  answer how many were enqueued. A nil submit means skip-if-active found
+  a live job for that team: nothing enqueued, not counted."
   [cfg team-ids delay]
   (reduce (fn [n team-id]
             (if (jobs/submit cfg
@@ -120,17 +118,26 @@
           team-ids))
 
 (defn execute-schedule
-  "Stream every dirty team oldest-first and enqueue one recompute job
-  per team, staggered by chunk so the queue does not spike. Runs
-  inside the caller read-only transaction (the job-def handler opens
-  it: pgjdbc only streams the plan cursor with auto-commit off): each
-  chunk is submitted through its own writable transaction (progress is
-  durable: killing the run keeps the chunks already enqueued and the
-  next tick picks up the rest). Teams with a live job are skipped
-  (`skip-if-active` on the team id as label); their mark survives and a
-  later tick picks them up. The rows are only read as values (`map
-  :team-id` before `partition-all`): a plan row is a view over the open
-  result set, so buffering rows would read nil columns."
+  "Stream every dirty team oldest-first and enqueue one recompute job per
+  team, staggered by chunk so the queue does not spike.
+
+  Runs in the caller transaction: `db/plan` needs one (pgjdbc only streams
+  the cursor with auto-commit off) and the submits join it on purpose, one
+  connection and one transaction. The whole schedule therefore commits at
+  the end: the queued jobs are not visible until the scan finishes, and a
+  failure rolls the run back. The next tick repeats it, which is safe
+  because `skip-if-active` dedupes the live jobs and the `dirty_at` marks
+  are only cleared by a recompute.
+
+  The heartbeat goes to the pool on purpose (a beat must survive a rollback
+  of the schedule), so a run that beats uses a second connection while the
+  plan transaction is open.
+
+  Teams with a live job are skipped (`skip-if-active` on the team id as
+  label); their mark survives and a later tick picks them up. The rows are
+  only read as values (`map :team-id` before `partition-all`): a plan row
+  is a view over the open result set, so buffering rows would read nil
+  columns."
   [{:keys [::db/conn] :as cfg}]
   (transduce
    (comp (map :team-id)
@@ -138,8 +145,7 @@
          (map-indexed vector))
    (completing
     (fn [total [chunk-idx team-ids]]
-      (let [submitted (-> (db/own-transaction cfg)
-                          (db/tx-run! submit-team-chunk team-ids (chunk-delay chunk-idx)))]
+      (let [submitted (submit-team-chunk cfg team-ids (chunk-delay chunk-idx))]
         (jobs/heartbeat cfg)
         (+ total ^long submitted))))
    0
@@ -172,12 +178,11 @@
    ::jobs/validator (sm/validator schema:schedule-recompute-params)
    ::jobs/handler
    (fn [_context _params]
-     ;; Read-only: pgjdbc only honors the plan fetch-size (a real
-     ;; streaming cursor) with auto-commit off, so the whole stream
-     ;; runs in one read transaction. The chunk submits open their
-     ;; own writable transactions (see db/own-transaction).
-     (-> (assoc cfg ::db/read-only true)
-         (db/tx-run! execute-schedule)))})
+     ;; The plan needs a transaction (pgjdbc only streams the cursor with
+     ;; auto-commit off) and the submits join it: one connection, one
+     ;; transaction for the whole schedule. A rollback just repeats the
+     ;; run on the next tick.
+     (db/tx-run! cfg execute-schedule))})
 
 (defmethod ig/init-key ::recompute-job-def
   [_ cfg]

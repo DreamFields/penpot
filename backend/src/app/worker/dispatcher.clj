@@ -74,14 +74,16 @@
       AND modified_at < ?::timestamptz")
 
 (def ^:private sql:abort-lost
-  "Abort the lost rows by id. The status and the tenant are repeated in
-  the outer WHERE so a row claimed (or aborted by another dispatcher)
-  between the candidate read and this UPDATE affects no row."
+  "Abort the lost rows by id. The status, the tenant and the hand-off time
+  are repeated in the outer WHERE so a claim, a heartbeat or a competing
+  dispatcher that lands between the candidate read and this UPDATE affects
+  no row."
   "UPDATE job
       SET status='aborted', modified_at=?::timestamptz, error=?::jsonb
     WHERE id = ANY(?)
       AND status = 'scheduled'
       AND tenant = ?
+      AND modified_at < ?::timestamptz
 RETURNING job.id, job.queue, job.name, job.created_at")
 
 (def ^:private sql:mark-orphan
@@ -101,13 +103,18 @@ RETURNING job.id, job.queue, job.name, job.created_at")
 RETURNING job.id, job.queue, job.name, job.created_at")
 
 (def ^:private lost-grace
-  "How long a `scheduled` row may wait before its queue is inspected.
-  Covers the gap between a worker popping a message and claiming the row."
+  "How long a `scheduled` row may wait before its queue is inspected. It
+  also covers the pop-to-claim gap of a message popped right after the
+  hand-off. A message that waited longer in the queue and is popped while
+  the sweep runs is not covered: the window is the pop-to-claim round trip
+  and the abort can win it (see `abort-lost-jobs`)."
   (ct/duration "5m"))
 
 (def ^:private lost-cap
   "Beyond this age a `scheduled` row is aborted even if its queue still has
-  messages: the job is lost behind a backlog, or its queue has no consumer."
+  messages: the job is lost behind a backlog, or its queue has no consumer.
+  A daily cron lost in a backed-up queue can miss one run, because its live
+  row blocks the next submit until the cap."
   (ct/duration "24h"))
 
 ;; the error travels as text and PostgreSQL casts it: a PGobject parameter
@@ -160,7 +167,11 @@ RETURNING job.id, job.queue, job.name, job.created_at")
   longer than the grace (a worker that popped it died before claiming), or
   when it has been `scheduled` past the cap (lost behind a backlog, or a
   queue without a consumer). Lost rows are never re-dispatched: nothing
-  returns to `new`, which keeps the dedupe index out of this path."
+  returns to `new`, which keeps the dedupe index out of this path.
+
+  The grace is measured from the push, so a worker that pops a message
+  older than the grace and stalls before claiming it can still lose that
+  job: the sweep cannot tell a slow worker from a dead one."
   [cfg]
   (let [{:keys [::db/conn ::timestamp ::wrk/tenant]} cfg
         grace   (ct/minus timestamp lost-grace)
@@ -177,7 +188,8 @@ RETURNING job.id, job.queue, job.name, job.created_at")
                                     timestamp
                                     lost-error-json
                                     (db/create-array conn "uuid" (map :id lost))
-                                    tenant]
+                                    tenant
+                                    grace]
                               {:return-keys true})]
         (record-aborted cfg aborted)
         (db/after-commit

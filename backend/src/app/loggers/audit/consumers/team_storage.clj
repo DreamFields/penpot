@@ -171,8 +171,8 @@
            :events (count events)
            :teams (count team-ids))
     ;; No relevant event carries any team key: a producer stopped keying
-    ;; its events. An explicit empty collection does not count (see
-    ;; carries-team-keys?).
+    ;; its events. An explicit empty collection does not count as a missing
+    ;; key (see carries-team-keys?), so it does not warn.
     (when (and (seq events)
                (not-any? carries-team-keys? events))
       (l/warn :hint "storage-usage chunk resolved no team ids"
