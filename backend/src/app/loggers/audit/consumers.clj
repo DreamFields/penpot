@@ -41,14 +41,14 @@
 
 ;; Consumer ids are fixed constants, never reuse one: a retired id keeps
 ;; meaning its old position in `audit_log_consumer_cursor`.
-(def consumer-nexus 1)
-(def consumer-admin-console 2)
-(def consumer-team-storage 3)
+(def nexus 1)
+(def admin-console 2)
+(def team-storage 3)
 
 (def ^:private consumers
-  [{:id consumer-nexus         :flag :nexus         :label "nexus"}
-   {:id consumer-admin-console :flag :admin-console :label "admin-console"}
-   {:id consumer-team-storage  :flag :storage-usage :label "team-storage"}])
+  [{:id nexus         :flag :nexus         :label "nexus"}
+   {:id admin-console :flag :admin-console :label "admin-console"}
+   {:id team-storage  :flag :storage-usage :label "team-storage"}])
 
 (def ^:private xf:enabled-consumers
   "Static transducer: keep the consumers whose flag is on. Allocated
@@ -417,7 +417,7 @@
   buffer is empty, short enough that an event waits seconds, not minutes."
   5000)
 
-(defn start-consumer-loop
+(defn start-loop
   "Start the daemon thread of one consumer: a pass, a pause, forever.
 
   `run-pass` gets the cfg and may throw: the loop logs the failure and
@@ -457,7 +457,7 @@
 ;; COMPONENT
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(defn init-consumer-component
+(defn init-component
   "Start the loop of a consumer when its flag is on and the database is
   writable; nil otherwise. `prepare` runs only on the start path and
   answers the cfg the pass will use (Nexus resolves its uri there)."
@@ -470,9 +470,9 @@
     (l/wrn :hint "not started (db is read-only)" :consumer (consumer-label consumer-id))
 
     :else
-    (start-consumer-loop (prepare cfg) consumer-id run-pass)))
+    (start-loop (prepare cfg) consumer-id run-pass)))
 
-(defn halt-consumer-component
+(defn halt-component
   "Stop the loop of a consumer and wait for it. Tolerates the nil an init
   that skipped the start answers."
   [thread]

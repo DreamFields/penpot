@@ -53,9 +53,9 @@
   cursor rows, and the drain would otherwise create them at the end of
   the buffer (the 'a new consumer sees no history' rule)."
   [next]
-  (doseq [consumer-id [consumer/consumer-nexus
-                       consumer/consumer-admin-console
-                       consumer/consumer-team-storage]]
+  (doseq [consumer-id [consumer/nexus
+                       consumer/admin-console
+                       consumer/team-storage]]
     (th/db-exec! ["INSERT INTO audit_log_consumer_cursor (consumer, xid, seq)
                    VALUES (?::smallint, '0'::xid8, 0)"
                   consumer-id]))
@@ -110,7 +110,7 @@
 (defn- run-nexus
   ([] (run-nexus {}))
   ([params]
-   (consumer.nexus/execute-audit-log-consumer-nexus
+   (consumer.nexus/run-pass
     (nexus-cfg (:uri params)))))
 
 (defn- admin-console-cfg
@@ -121,7 +121,7 @@
 
 (defn- run-admin-console
   []
-  (consumer.admin-console/execute-audit-log-consumer-admin-console
+  (consumer.admin-console/run-pass
    (admin-console-cfg (:app.metrics/metrics th/*system*))))
 
 (defn- run-gc
@@ -160,18 +160,18 @@
       (with-mocks [http-mock {:target 'app.http.client/req :return {:status 204}}]
         (insert-audit-row (:id prof) "create-project")
         (insert-audit-row (:id prof) "create-file")
-        (t/is (= 2 (unread-count consumer/consumer-nexus)))
+        (t/is (= 2 (unread-count consumer/nexus)))
         (run-nexus {:uri archive-uri})
         (t/is (:called? @http-mock))
         (t/is (= 1 (:call-count @http-mock)))
         (let [events (-> @http-mock :call-args second :body transit/decode :events)]
           (t/is (= ["create-project" "create-file"] (mapv :name events))))
         ;; The cursor advanced; the rows stay until the GC removes them.
-        (t/is (= 0 (unread-count consumer/consumer-nexus)))
+        (t/is (= 0 (unread-count consumer/nexus)))
         (t/is (= 2 (count (th/db-exec! ["SELECT * FROM audit_log"]))))
         ;; Nobody else moved: each consumer has its own position.
-        (t/is (= 2 (unread-count consumer/consumer-admin-console)))
-        (t/is (= 2 (unread-count consumer/consumer-team-storage)))))))
+        (t/is (= 2 (unread-count consumer/admin-console)))
+        (t/is (= 2 (unread-count consumer/team-storage)))))))
 
 (t/deftest consumer-nexus-sends-in-insertion-order
   (let [prof  (th/create-profile* 2 {:is-active true})
@@ -185,7 +185,7 @@
               events  (mapcat :events bodies)]
           (t/is (= 2 (count bodies)))
           (t/is (= names (mapv :name events)))
-          (t/is (= 0 (unread-count consumer/consumer-nexus))))))))
+          (t/is (= 0 (unread-count consumer/nexus))))))))
 
 (t/deftest consumer-nexus-default-uri-appends-api-audit
   (let [prof (th/create-profile* 3 {:is-active true})
@@ -225,7 +225,7 @@
           (let [thread (ig/init-key :app.loggers.audit.consumers.nexus/consumer
                                     (nexus-cfg archive-uri))]
             (try
-              (t/is (th/wait-for #(zero? (unread-count consumer/consumer-nexus))))
+              (t/is (th/wait-for #(zero? (unread-count consumer/nexus))))
               (t/is (:called? @http-mock))
               (finally
                 (ig/halt-key! :app.loggers.audit.consumers.nexus/consumer thread)))
@@ -252,7 +252,7 @@
           (t/is (= ["create-project" "create-file"]
                    (mapv :name (:events params)))))
         ;; Every row was passed over: the skipped ones and the ones sent.
-        (t/is (= 0 (unread-count consumer/consumer-admin-console)))))))
+        (t/is (= 0 (unread-count consumer/admin-console)))))))
 
 (t/deftest consumer-admin-console-advances-over-non-matching-rows
   ;; A selective consumer that finds nothing must still move: otherwise
@@ -264,7 +264,7 @@
           (insert-audit-row (:id prof) (str "unrelated-" i)))
         (run-admin-console)
         (t/is (false? (:called? @admin-console-mock)))
-        (t/is (= 0 (unread-count consumer/consumer-admin-console)))))))
+        (t/is (= 0 (unread-count consumer/admin-console)))))))
 
 (t/deftest consumer-admin-console-error-still-lets-nexus-drain
   (let [prof (th/create-profile* 12 {:is-active true})]
@@ -276,8 +276,8 @@
         (run-nexus {:uri archive-uri})
         (t/is (thrown? clojure.lang.ExceptionInfo
                        (run-admin-console)))
-        (t/is (= 0 (unread-count consumer/consumer-nexus)))
-        (t/is (= 1 (unread-count consumer/consumer-admin-console)))))))
+        (t/is (= 0 (unread-count consumer/nexus)))
+        (t/is (= 1 (unread-count consumer/admin-console)))))))
 
 (t/deftest consumer-admin-console-component-does-not-start-with-the-flag-off
   (with-redefs [cf/flags #{}]
@@ -294,7 +294,7 @@
           (let [thread (ig/init-key :app.loggers.audit.consumers.admin-console/consumer
                                     (admin-console-cfg (:app.metrics/metrics th/*system*)))]
             (try
-              (t/is (th/wait-for #(zero? (unread-count consumer/consumer-admin-console))))
+              (t/is (th/wait-for #(zero? (unread-count consumer/admin-console))))
               (t/is (:called? @admin-console-mock))
               (finally
                 (ig/halt-key! :app.loggers.audit.consumers.admin-console/consumer thread)))
@@ -325,7 +325,7 @@
           (let [team-id (uuid/next)
                 row     (insert-audit-row (:id prof) "create-project"
                                           {:team-id team-id})]
-            (consumer.admin-console/execute-audit-log-consumer-admin-console consumer-cfg)
+            (consumer.admin-console/run-pass consumer-cfg)
             (t/is (= 1 (count @admin-console-bodies)))
             (let [body  (json/decode (first @admin-console-bodies) :key-fn json/read-kebab-key)
                   event (first (:events body))]
@@ -336,7 +336,7 @@
               (t/is (string? (:created-at event)))
               (t/is (string? (:tracked-at event)))
               (t/is (= (str team-id) (str (get-in event [:props :team-id])))))
-            (t/is (= 0 (unread-count consumer/consumer-admin-console)))))))))
+            (t/is (= 0 (unread-count consumer/admin-console)))))))))
 
 (t/deftest consumer-admin-console-enriches-team-name-and-emails
   (let [actor  (th/create-profile* 14 {:is-active true})
@@ -450,7 +450,7 @@
                :props         {}}]
     (db/tx-run! th/*system*
                 (fn [cfg]
-                  (let [enriched (first (#'consumer.admin-console/enrich-events-for-admin-console
+                  (let [enriched (first (#'consumer.admin-console/enrich-events
                                          cfg [event]))]
                     (t/is (= "preset@example.com" (:profile-email enriched)))
                     (t/is (= "Preset Name" (:profile-name enriched))))))))
@@ -461,11 +461,11 @@
   (let [actor (th/create-profile* 73 {:is-active true})]
     (db/tx-run! th/*system*
                 (fn [cfg]
-                  (let [email-only (first (#'consumer.admin-console/enrich-events-for-admin-console
+                  (let [email-only (first (#'consumer.admin-console/enrich-events
                                            cfg [{:profile-id    (:id actor)
                                                  :profile-email "preset@example.com"
                                                  :props         {}}]))
-                        name-only  (first (#'consumer.admin-console/enrich-events-for-admin-console
+                        name-only  (first (#'consumer.admin-console/enrich-events
                                            cfg [{:profile-id   (:id actor)
                                                  :profile-name "Preset Name"
                                                  :props        {}}]))]
@@ -547,13 +547,13 @@
           (run-nexus {:uri archive-uri})
           ;; A is the oldest live transaction: the cut leaves out B too.
           (t/is (false? (:called? @http-mock)))
-          (t/is (= 0 (:seq (cursor-of consumer/consumer-nexus))))
+          (t/is (= 0 (:seq (cursor-of consumer/nexus))))
           (db/exec! conn ["COMMIT"]))
         ;; A is committed: both rows are visible, in xid order.
         (run-nexus {:uri archive-uri})
         (let [events (-> @http-mock :call-args second :body transit/decode :events)]
           (t/is (= ["tx-A" "tx-B"] (mapv :name events))))
-        (t/is (= 0 (unread-count consumer/consumer-nexus)))))))
+        (t/is (= 0 (unread-count consumer/nexus)))))))
 
 (t/deftest cursor-processes-a-large-transaction-in-chunks-without-loss
   (let [prof  (th/create-profile* 31 {:is-active true})
@@ -565,7 +565,7 @@
           ;; While the transaction is open nothing is visible.
           (run-nexus {:uri archive-uri})
           (t/is (false? (:called? @http-mock)))
-          (t/is (= 0 (:seq (cursor-of consumer/consumer-nexus))))
+          (t/is (= 0 (:seq (cursor-of consumer/nexus))))
           (db/exec! conn ["COMMIT"]))
         ;; After the commit the 300 rows are read in 128-row chunks,
         ;; and the seq within the transaction keeps their order.
@@ -575,7 +575,7 @@
               events (mapcat :events bodies)]
           (t/is (= [128 128 44] (mapv #(count (:events %)) bodies)))
           (t/is (= names (mapv :name events))))
-        (t/is (= 0 (unread-count consumer/consumer-nexus)))))))
+        (t/is (= 0 (unread-count consumer/nexus)))))))
 
 (t/deftest cursor-lock-serializes-two-runs-of-the-same-consumer
   (let [prof (th/create-profile* 32 {:is-active true})]
@@ -586,7 +586,7 @@
           (db/exec! conn ["BEGIN"])
           (db/exec! conn ["SELECT consumer FROM audit_log_consumer_cursor
                             WHERE consumer = ?::smallint FOR UPDATE"
-                          consumer/consumer-nexus])
+                          consumer/nexus])
           (let [system th/*system*
                 job    (future (binding [th/*system* system]
                                  (run-nexus {:uri archive-uri})))]
@@ -596,7 +596,7 @@
             (db/exec! conn ["COMMIT"])
             (t/is (not= :timeout (deref job 10000 :timeout))))
           (t/is (:called? @http-mock))
-          (t/is (= 0 (unread-count consumer/consumer-nexus))))))))
+          (t/is (= 0 (unread-count consumer/nexus))))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; THE TICK: ONE PASS ACROSS INSTANCES, WITH A FRONTIER
@@ -627,16 +627,16 @@
       (with-mocks [http-mock {:target 'app.http.client/req :return {:status 204}}]
         (insert-audit-row (:id prof) "create-project")
         (with-open [conn (db/open th/*system*)]
-          (let [tick (hold-tick conn consumer/consumer-nexus)]
+          (let [tick (hold-tick conn consumer/nexus)]
             ;; Another instance is draining: this pass does nothing.
             (t/is (= ::consumer/busy (run-nexus {:uri archive-uri})))
             (t/is (false? (:called? @http-mock)))
-            (t/is (= 0 (:seq (cursor-of consumer/consumer-nexus))))
+            (t/is (= 0 (:seq (cursor-of consumer/nexus))))
             (t/is (true? (release-tick conn tick)))))
         ;; With the tick free, the same pass drains.
         (run-nexus {:uri archive-uri})
         (t/is (:called? @http-mock))
-        (t/is (= 0 (unread-count consumer/consumer-nexus)))))))
+        (t/is (= 0 (unread-count consumer/nexus)))))))
 
 (t/deftest consumer-tick-busy-records-only-the-pass-counter
   (let [prof     (th/create-profile* 34 {:is-active true})
@@ -647,7 +647,7 @@
       (with-mocks [http-mock {:target 'app.http.client/req :return {:status 204}}]
         (insert-audit-row (:id prof) "create-project")
         (with-open [conn (db/open th/*system*)]
-          (let [tick (hold-tick conn consumer/consumer-nexus)]
+          (let [tick (hold-tick conn consumer/nexus)]
             (t/is (= ::consumer/busy (run-nexus {:uri archive-uri})))
             (release-tick conn tick)))
         (t/is (= [[:audit-consumer-passes ["nexus" "busy"] 1]] @recorded))
@@ -658,7 +658,7 @@
   ;; id; the consumers take a two-key one, a different lock space, so a
   ;; file lock with the same numbers cannot block a pass.
   (let [prof (th/create-profile* 36 {:is-active true})
-        [classid objid] (#'consumer/tick-lock-key consumer/consumer-nexus)
+        [classid objid] (#'consumer/tick-lock-key consumer/nexus)
         bigint-key (+ (* (long classid) 4294967296) objid)]
     (with-redefs [cf/flags #{:nexus}]
       (with-mocks [http-mock {:target 'app.http.client/req :return {:status 204}}]
@@ -687,7 +687,7 @@
 (defn- run-nexus-on
   "Run one nexus pass merging `overrides` over the test cfg."
   [overrides]
-  (consumer.nexus/execute-audit-log-consumer-nexus
+  (consumer.nexus/run-pass
    (merge (nexus-cfg archive-uri) overrides)))
 
 (t/deftest consumer-pass-needs-one-connection
@@ -705,7 +705,7 @@
           (let [bodies (map #(transit/decode (:body (second %)))
                             (:call-args-list @http-mock))]
             (t/is (= [128 128 44] (mapv #(count (:events %)) bodies))))
-          (t/is (= 0 (unread-count consumer/consumer-nexus)))))
+          (t/is (= 0 (unread-count consumer/nexus)))))
       (finally
         (ig/halt-key! :app.db/pool pool)))))
 
@@ -720,11 +720,11 @@
         (with-mocks [http-mock {:target 'app.http.client/req :return {:status 204}}]
           (insert-audit-row (:id prof) "create-project")
           (with-open [conn (db/open pool)]
-            (let [[classid objid] (#'consumer/tick-lock-key consumer/consumer-nexus)]
+            (let [[classid objid] (#'consumer/tick-lock-key consumer/nexus)]
               (t/is (true? (db/session-try-lock conn classid objid)))))
           (run-nexus-on {::db/pool pool})
           (t/is (:called? @http-mock))
-          (t/is (= 0 (unread-count consumer/consumer-nexus)))))
+          (t/is (= 0 (unread-count consumer/nexus)))))
       (finally
         (ig/halt-key! :app.db/pool pool)))))
 
@@ -738,11 +738,11 @@
         (insert-audit-row (:id prof) "create-file")
         (th/db-exec! ["DELETE FROM audit_log_consumer_cursor
                         WHERE consumer = ?::smallint"
-                      consumer/consumer-nexus])
+                      consumer/nexus])
         (run-nexus {:uri archive-uri})
         (t/is (false? (:called? @http-mock)))
-        (t/is (some? (cursor-of consumer/consumer-nexus)))
-        (t/is (= 0 (unread-count consumer/consumer-nexus)))))))
+        (t/is (some? (cursor-of consumer/nexus)))
+        (t/is (= 0 (unread-count consumer/nexus)))))))
 
 (t/deftest consumer-pass-stops-at-the-watermark
   ;; A pass drains up to the newest row that existed when it started: a
@@ -762,19 +762,19 @@
         (t/is (= 1 (:call-count @http-mock)))
         (t/is (= ["before-1" "before-2"] (sent-event-names http-mock)))
         ;; The row of the pass in course waits for the next one.
-        (t/is (= 1 (unread-count consumer/consumer-nexus)))
+        (t/is (= 1 (unread-count consumer/nexus)))
         (run-nexus {:uri archive-uri})
         (t/is (= 2 (:call-count @http-mock)))
         (t/is (= ["before-1" "before-2" "mid-pass"] (sent-event-names http-mock)))
-        (t/is (= 0 (unread-count consumer/consumer-nexus)))))))
+        (t/is (= 0 (unread-count consumer/nexus)))))))
 
 (t/deftest consumer-loop-runs-passes-until-interrupted
   (let [passes (atom 0)]
     (with-redefs-fn {#'consumer/sleep-ms 10}
       (fn []
-        (let [thread (consumer/start-consumer-loop
+        (let [thread (consumer/start-loop
                       {}
-                      consumer/consumer-nexus
+                      consumer/nexus
                       (fn [_] (swap! passes inc)))]
           (try
             (loop [i 0]
@@ -791,9 +791,9 @@
   (let [passes (atom 0)]
     (with-redefs-fn {#'consumer/sleep-ms 10}
       (fn []
-        (let [thread (consumer/start-consumer-loop
+        (let [thread (consumer/start-loop
                       {}
-                      consumer/consumer-nexus
+                      consumer/nexus
                       (fn [_]
                         (swap! passes inc)
                         (throw (ex-info "boom" {}))))]
@@ -829,13 +829,13 @@
   "Run one nexus pass with an isolated metrics registry, so assertions
   read exact values instead of the shared test-system registry."
   [metrics params]
-  (consumer.nexus/execute-audit-log-consumer-nexus
+  (consumer.nexus/run-pass
    (nexus-cfg (:uri params) metrics)))
 
 (defn- invoke-admin-console
   "Run one admin-console pass with an isolated metrics registry."
   [metrics]
-  (consumer.admin-console/execute-audit-log-consumer-admin-console
+  (consumer.admin-console/run-pass
    (admin-console-cfg metrics)))
 
 (defn- invoke-both
@@ -880,8 +880,8 @@
         (t/is (= 2.0 (counter-value metrics :audit-consumer-events ["nexus" "processed"])))
         (t/is (= 1.0 (counter-value metrics :audit-consumer-events ["admin-console" "processed"])))
         (t/is (= 1.0 (counter-value metrics :audit-consumer-events ["admin-console" "skipped"])))
-        (t/is (= 0 (unread-count consumer/consumer-nexus)))
-        (t/is (= 0 (unread-count consumer/consumer-admin-console)))))))
+        (t/is (= 0 (unread-count consumer/nexus)))
+        (t/is (= 0 (unread-count consumer/admin-console)))))))
 
 (t/deftest consumer-records-the-lag-gauge
   (let [prof    (th/create-profile* 41 {:is-active true})
@@ -890,7 +890,7 @@
     (insert-audit-row (:id prof) "create-file")
     ;; The cursor is still at zero: two confirmed events behind.
     (with-open [conn (db/open th/*system*)]
-      (#'consumer/record-lag conn metrics {:id consumer/consumer-nexus}))
+      (#'consumer/record-lag conn metrics {:id consumer/nexus}))
     (t/is (= 2.0 (gauge-value metrics :audit-consumer-lag ["nexus"])))))
 
 (t/deftest consumer-pass-counter-records-ok-and-busy
@@ -904,7 +904,7 @@
 
         (insert-audit-row (:id prof) "create-file")
         (with-open [conn (db/open th/*system*)]
-          (let [tick (hold-tick conn consumer/consumer-nexus)]
+          (let [tick (hold-tick conn consumer/nexus)]
             (t/is (= ::consumer/busy (invoke-nexus metrics {:uri archive-uri})))
             (release-tick conn tick)))
         (t/is (= 1.0 (counter-value metrics :audit-consumer-passes ["nexus" "busy"])))
@@ -927,7 +927,7 @@
         ;; The tick was released: the next pass drains and counts ok.
         (invoke-nexus metrics {:uri archive-uri})
         (t/is (= 1.0 (counter-value metrics :audit-consumer-passes ["nexus" "ok"])))
-        (t/is (= 0 (unread-count consumer/consumer-nexus)))))))
+        (t/is (= 0 (unread-count consumer/nexus)))))))
 
 (t/deftest consumer-pass-reports-the-chunks-that-committed-before-a-failure
   ;; A refusal on the second chunk must not hide the 128 events of the
@@ -947,7 +947,7 @@
         (t/is (thrown? clojure.lang.ExceptionInfo
                        (invoke-nexus metrics {:uri archive-uri})))
         ;; The first chunk committed and the cursor moved past it.
-        (t/is (= 172 (unread-count consumer/consumer-nexus)))
+        (t/is (= 172 (unread-count consumer/nexus)))
         (t/is (= 128.0 (counter-value metrics :audit-consumer-events ["nexus" "processed"])))
         (t/is (= 128.0 (counter-value metrics :audit-consumer-events ["nexus" "failed"])))
         (t/is (= 1.0 (counter-value metrics :audit-consumer-passes ["nexus" "failed"])))))))
@@ -963,7 +963,7 @@
 
         (insert-audit-row (:id prof) "create-file")
         (with-open [conn (db/open th/*system*)]
-          (let [tick (hold-tick conn consumer/consumer-nexus)]
+          (let [tick (hold-tick conn consumer/nexus)]
             (t/is (= ::consumer/busy (invoke-nexus metrics {:uri archive-uri})))
             (release-tick conn tick)))
         ;; Still the sample of the first pass, not the row behind.
@@ -986,7 +986,7 @@
                           (:call-args-list @http-mock))]
           (t/is (= [128 128 44] (mapv #(count (:events %)) bodies))))
         ;; The rows that arrived during the pass wait for the next one.
-        (t/is (= 3 (unread-count consumer/consumer-nexus)))))))
+        (t/is (= 3 (unread-count consumer/nexus)))))))
 
 (t/deftest consumer-component-does-not-start-on-a-read-only-database
   (let [pool (make-pool 1 {::db/read-only true})]
@@ -1007,7 +1007,7 @@
       (insert-rows-in-one-transaction conn "lote-" 10001)
       (db/exec! conn ["COMMIT"]))
     (with-open [conn (db/open th/*system*)]
-      (#'consumer/record-lag conn metrics {:id consumer/consumer-nexus}))
+      (#'consumer/record-lag conn metrics {:id consumer/nexus}))
     (t/is (= 10000.0 (gauge-value metrics :audit-consumer-lag ["nexus"])))))
 
 (t/deftest consumer-nexus-transport-failure-records-failed
@@ -1021,7 +1021,7 @@
                        (invoke-nexus metrics {:uri archive-uri})))
         (t/is (= 1.0 (counter-value metrics :audit-consumer-events ["nexus" "failed"])))
         ;; The chunk rolled back: the cursor did not move.
-        (t/is (= 1 (unread-count consumer/consumer-nexus)))))))
+        (t/is (= 1 (unread-count consumer/nexus)))))))
 
 (t/deftest consumer-nexus-refused-chunk-keeps-the-cursor
   (let [prof    (th/create-profile* 43 {:is-active true})
@@ -1035,7 +1035,7 @@
                     (catch clojure.lang.ExceptionInfo cause cause))]
           (t/is (= :consumer-chunk-refused (:code (ex-data err)))))
         (t/is (= 1.0 (counter-value metrics :audit-consumer-events ["nexus" "failed"])))
-        (t/is (= 1 (unread-count consumer/consumer-nexus)))))))
+        (t/is (= 1 (unread-count consumer/nexus)))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; PRODUCER: ONE ROW, NO QUEUE
@@ -1064,8 +1064,8 @@
                   (zero? (:cnt (th/db-exec-one!
                                 ["SELECT count(*) AS cnt FROM audit_log_pending"]))))))
       ;; The cursors did not move: the row waits for the next drain.
-      (t/is (= 1 (unread-count consumer/consumer-nexus)))
-      (t/is (= 1 (unread-count consumer/consumer-admin-console))))))
+      (t/is (= 1 (unread-count consumer/nexus)))
+      (t/is (= 1 (unread-count consumer/admin-console))))))
 
 (t/deftest producer-rollback-leaves-no-row
   (let [prof (th/create-profile* 51 {:is-active true})]
@@ -1140,7 +1140,7 @@
         (dotimes [i 5]
           (insert-audit-row (:id prof) (str "event-" i)))
         (run-nexus {:uri archive-uri})
-        (with-redefs-fn {#'gc/gc-batch-size 2}
+        (with-redefs-fn {#'gc/batch-size 2}
           (fn []
             (t/is (= 5 (run-gc)))))
         (t/is (= 0 (count (th/db-exec! ["SELECT * FROM audit_log"]))))))))
@@ -1152,7 +1152,7 @@
   (let [prof (th/create-profile* 65 {:is-active true})]
     (th/db-exec! ["DELETE FROM audit_log_consumer_cursor
                     WHERE consumer = ?::smallint"
-                  consumer/consumer-team-storage])
+                  consumer/team-storage])
     (with-redefs [cf/flags #{:nexus :storage-usage}]
       (with-mocks [http-mock {:target 'app.http.client/req :return {:status 204}}]
         (insert-audit-row (:id prof) "create-project")
@@ -1162,9 +1162,9 @@
         (t/is (= 1 (count (th/db-exec! ["SELECT * FROM audit_log"]))))
         ;; Its first drain creates the cursor at the end (it does not
         ;; process the history), and the next GC can delete.
-        (team-storage/execute-audit-log-consumer-team-storage
+        (team-storage/run-pass
          {::db/pool     (:app.db/pool th/*system*)
           ::mtx/metrics (:app.metrics/metrics th/*system*)})
-        (t/is (some? (cursor-of consumer/consumer-team-storage)))
+        (t/is (some? (cursor-of consumer/team-storage)))
         (t/is (= 1 (run-gc)))
         (t/is (= 0 (count (th/db-exec! ["SELECT * FROM audit_log"]))))))))

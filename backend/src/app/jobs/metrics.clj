@@ -65,7 +65,7 @@
                 [(name-label name) (d/name outcome)]
                 1))
 
-(defn record-submitted
+(defn record-created
   [cfg name]
   (record-submit cfg :created name))
 

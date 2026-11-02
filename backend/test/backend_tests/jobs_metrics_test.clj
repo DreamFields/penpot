@@ -212,7 +212,7 @@
 (t/deftest lifecycle-helpers-use-labels-as-is
   (let [metrics (make-metrics)
         cfg     (metrics-cfg metrics)]
-    (jobs-metrics/record-submitted cfg "delete-object")
+    (jobs-metrics/record-created cfg "delete-object")
     (jobs-metrics/record-skipped cfg "delete-object")
     (jobs-metrics/record-dispatched cfg "delete-object" 2)
     (jobs-metrics/record-total cfg "delete-object" :completed 42)
@@ -261,7 +261,7 @@
 (t/deftest unknown-names-go-to-metrics-as-is
   (let [metrics (make-metrics)
         cfg     (metrics-cfg metrics)]
-    (jobs-metrics/record-submitted cfg "unknown-job")
+    (jobs-metrics/record-created cfg "unknown-job")
     (t/is (= 1.0 (counter-value metrics :jobs-submit ["unknown-job" "created"])))))
 
 (t/deftest event-counter-has-no-labels-and-follows-the-events

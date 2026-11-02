@@ -45,9 +45,9 @@
   drain would create the cursor at the end of the buffer and skip the
   events the test just inserted."
   [next]
-  (doseq [consumer-id [consumer/consumer-nexus
-                       consumer/consumer-admin-console
-                       consumer/consumer-team-storage]]
+  (doseq [consumer-id [consumer/nexus
+                       consumer/admin-console
+                       consumer/team-storage]]
     (th/db-exec! ["INSERT INTO audit_log_consumer_cursor (consumer, xid, seq)
                    VALUES (?::smallint, '0'::xid8, 0)"
                   consumer-id]))
@@ -60,7 +60,7 @@
   (th/db-exec-one! ["SELECT xid::text AS xid, seq
                        FROM audit_log_consumer_cursor
                       WHERE consumer = ?::smallint"
-                    consumer/consumer-team-storage]))
+                    consumer/team-storage]))
 
 (defn- unread-count
   []
@@ -77,7 +77,7 @@
 
 (defn- run-team-storage
   []
-  (team-storage/execute-audit-log-consumer-team-storage
+  (team-storage/run-pass
    (team-storage-consumer-cfg)))
 
 (defn- usage-row
@@ -136,7 +136,7 @@
 
 (t/deftest storage-usage-consumer-covers-every-listed-name
   ;; Pins the reaction contract for every name in
-  ;; team-storage-event-names: each one marks the teams its key map
+  ;; event-names: each one marks the teams its key map
   ;; resolves, using the real prop shape. It fails when a name is
   ;; added without its case; the producers themselves are pinned by the
   ;; end-to-end tests (delete-file, delete-font-variant, moves,
@@ -168,7 +168,7 @@
                 ["restore-project" {:team-id team-b}]
                 ["restore-team" {:team-id team}]
                 ["file-gc" {:team-id team :file-id (:id file)}]]]
-    (t/is (= team-storage/team-storage-event-names (set (map first cases))))
+    (t/is (= team-storage/event-names (set (map first cases))))
     (with-redefs [cf/flags test-flags]
       (doseq [[nm props] cases]
         (append-row nm props))

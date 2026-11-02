@@ -295,7 +295,7 @@ Observability (the transports in `backend/src/app/loggers/audit/consumers/{nexus
 
 ### Team storage: a consumer of its own
 
-The third consumer (flag `:storage-usage`) lives in `app.tasks.team-storage` because that is the domain that owns its table. Its loop reads the whole stream from its cursor up to the pass frontier and takes the `team-storage-event-names` rows (never telemetry shadows), marking their teams dirty in one write per chunk; the rest count as skipped. A new consumer has its own cursor and its own loop, and the producer does not change. It feeds the `media-storage-bytes-per-team` quota counter (see `mem:backend/subtleties`).
+The third consumer (flag `:storage-usage`) lives in `app.tasks.team-storage` because that is the domain that owns its table. Its loop reads the whole stream from its cursor up to the pass frontier and takes the `event-names` rows (never telemetry shadows), marking their teams dirty in one write per chunk; the rest count as skipped. A new consumer has its own cursor and its own loop, and the producer does not change. It feeds the `media-storage-bytes-per-team` quota counter (see `mem:backend/subtleties`).
 
 ### How Nexus consumes the data (and forwards to PostHog)
 

@@ -32,7 +32,7 @@
    [app.nitrate :as nitrate]
    [integrant.core :as ig]))
 
-(def event-names-for-admin-console
+(def event-names
   "The event names the admin console archives. Each consumer owns its
   filter now: the producer only inserts the row, and this consumer
   decides on read which events concern it."
@@ -192,7 +192,7 @@
           (assoc :profile-name (:fullname profile)))
         event))))
 
-(defn- enrich-events-for-admin-console
+(defn- enrich-events
   "Enrich allowlisted events before the admin-console ingest:
   1. Fill missing :team-name from team id (including soft-deleted).
   2. Fill missing emails from matching id keys in props (including
@@ -214,14 +214,14 @@
                 (maybe-assoc-actor-profile profiles)))
           events)))
 
-(defn- send-to-admin-console
+(defn- send-events
   "Ingest rows into the admin console. Returns {:processed :skipped}
   (filtered-out rows count as skipped); throws carrying the attempted
-  count as :events, like send-to-nexus. Enrich failures propagate
+  count as :events, like send-events. Enrich failures propagate
   untouched: a local DB/decode failure is ours, not the destination's,
   and must not count as a send failure."
   [cfg rows]
-  (let [events   (filterv #(and (contains? event-names-for-admin-console (:name %))
+  (let [events   (filterv #(and (contains? event-names (:name %))
                                 (not (audit/telemetry-shadow-source? (:source %))))
                           rows)
         total    (count rows)
@@ -237,7 +237,7 @@
       ;; Enrich first, outside the try: a local DB/decode failure is
       ;; ours, not the destination's, and must not count as
       ;; admin-console/failed.
-      (let [enriched (enrich-events-for-admin-console cfg events)
+      (let [enriched (enrich-events cfg events)
             n        (count events)]
         (try
           (nitrate/call cfg :ingest-audit-log {:events enriched})
@@ -259,7 +259,7 @@
                              :cause cause
                              :events n))))))))
 
-(defn- process-admin-console-chunk
+(defn- process-chunk
   "Send one chunk to the admin console. Returns {:processed :skipped}:
   the row outside the allowlist (and the telemetry shadows) count as
   skipped. Throws on failure, same contract as the nexus one."
@@ -268,9 +268,16 @@
         _       (l/trc :hint "consumer events chunk"
                        :consumer "admin-console"
                        :events (count decoded))]
-    (send-to-admin-console cfg decoded)))
+    (send-events cfg decoded)))
 
-(declare execute-audit-log-consumer-admin-console)
+(defn run-pass
+  "One pass of the admin-console consumer: drain the stream from its cursor
+  up to the frontier of the pass. The loop of `::consumer` calls it once
+  per pass; direct callers (REPL, tests) get the same behavior."
+  [cfg]
+  (consumers/drain-consumer cfg
+                            consumers/admin-console
+                            process-chunk))
 
 (defmethod ig/assert-key ::consumer
   [_ cfg]
@@ -290,20 +297,11 @@
 
 (defmethod ig/init-key ::consumer
   [_ cfg]
-  (consumers/init-consumer-component cfg
-                                     consumers/consumer-admin-console
-                                     prepare
-                                     execute-audit-log-consumer-admin-console))
+  (consumers/init-component cfg
+                            consumers/admin-console
+                            prepare
+                            run-pass))
 
 (defmethod ig/halt-key! ::consumer
   [_ thread]
-  (consumers/halt-consumer-component thread))
-
-(defn execute-audit-log-consumer-admin-console
-  "One pass of the admin-console consumer: drain the stream from its cursor
-  up to the frontier of the pass. The loop of `::consumer` calls it once
-  per pass; direct callers (REPL, tests) get the same behavior."
-  [cfg]
-  (consumers/drain-consumer cfg
-                            consumers/consumer-admin-console
-                            process-admin-console-chunk))
+  (consumers/halt-component thread))

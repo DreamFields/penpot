@@ -69,7 +69,7 @@
   `:keys` are the top-level props `carries-team-keys?` checks with
   `contains?`, so an explicit empty collection counts as a fact and not
   as a producer that lost its keys. Adding a name here also adds it to
-  `team-storage-event-names`, so the two cannot drift."
+  `event-names`, so the two cannot drift."
   {"upload-file-media-object"          default-team-keys
    "create-file-media-object-from-url" default-team-keys
    "clone-file-media-object"           default-team-keys
@@ -97,7 +97,7 @@
    "restore-team"                      default-team-keys
    "file-gc"                           default-team-keys})
 
-(def team-storage-event-names
+(def event-names
   "Audit event names that can change per-team media storage. Only these
   mark the team dirty. Derived from `team-keys-by-name` so the list and
   the key map cannot disagree. Purges (`hard-delete-objects`) are
@@ -171,7 +171,7 @@
       SET dirty_at = EXCLUDED.dirty_at
     WHERE tsu.dirty_at IS NULL")
 
-(defn- mark-team-storage-dirty
+(defn- mark-dirty
   "Mark the teams dirty, keeping the oldest mark: a team marked twice in
   one window is recomputed once."
   [conn team-ids]
@@ -179,10 +179,10 @@
     (db/exec-one! conn [sql:mark-team-storage-dirty
                         (db/create-array conn "uuid" team-ids)])))
 
-(defn- process-team-storage-chunk
+(defn- process-chunk
   "Mark dirty the teams of the events of one chunk that concern the
   storage usage. Returns {:processed :skipped}: the events outside
-  `team-storage-event-names` and the telemetry shadows count as skipped,
+  `event-names` and the telemetry shadows count as skipped,
   so the consumer cursor advances over them and they are not retried.
 
   The events arrive already decoded (props as maps) and keyed by team in
@@ -192,14 +192,14 @@
         events (into []
                      (comp
                       (filter (fn [row]
-                                (and (contains? team-storage-event-names (:name row))
+                                (and (contains? event-names (:name row))
                                      (not (audit/telemetry-shadow-source? (:source row))))))
                       (map (fn [row]
                              (assoc (consumers/row->event (consumers/decode-row row))
                                     :id (:id row)))))
                      rows)
         teams  (collect-team-ids events)]
-    (mark-team-storage-dirty (::db/conn cfg) teams)
+    (mark-dirty (::db/conn cfg) teams)
     (l/trc :hint "storage-usage teams marked dirty"
            :events (count events)
            :teams (count teams))
@@ -214,7 +214,15 @@
     {:processed (count events)
      :skipped   (- total (count events))}))
 
-(declare execute-audit-log-consumer-team-storage)
+(defn run-pass
+  "One pass of the team-storage consumer: read the stream from its cursor
+  up to the frontier of the pass and mark the teams of the storage-usage
+  events dirty. The loop of `::consumer` calls it once per pass; direct
+  callers (REPL, tests) get the same behavior."
+  [cfg]
+  (consumers/drain-consumer cfg
+                            consumers/team-storage
+                            process-chunk))
 
 (defmethod ig/assert-key ::consumer
   [_ cfg]
@@ -228,30 +236,21 @@
 
 (defmethod ig/init-key ::consumer
   [_ cfg]
-  (consumers/init-consumer-component cfg
-                                     consumers/consumer-team-storage
-                                     prepare
-                                     execute-audit-log-consumer-team-storage))
+  (consumers/init-component cfg
+                            consumers/team-storage
+                            prepare
+                            run-pass))
 
 (defmethod ig/halt-key! ::consumer
   [_ thread]
-  (consumers/halt-consumer-component thread))
+  (consumers/halt-component thread))
 
-(defn execute-audit-log-consumer-team-storage
-  "One pass of the team-storage consumer: read the stream from its cursor
-  up to the frontier of the pass and mark the teams of the storage-usage
-  events dirty. The loop of `::consumer` calls it once per pass; direct
-  callers (REPL, tests) get the same behavior."
-  [cfg]
-  (consumers/drain-consumer cfg
-                            consumers/consumer-team-storage
-                            process-team-storage-chunk))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; RECOMPUTE
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(defn- recompute-team-storage
+(defn- recompute
   "Recompute one team: slow read, fast write. A mark written by a
   transaction that started after this recompute began survives (its
   dirty_at is newer than the read) and the next tick recomputes it. A
@@ -268,12 +267,12 @@
     (db/exec-one! conn [sql:upsert-team-storage-usage team-id total team-id read-at])
     total))
 
-(defn execute-recompute-team-storage
+(defn execute-recompute
   "Plain job handler: recompute a single team. A failure fails this
   job (the runner retries it); the team stays dirty, so the next
   scheduler tick enqueues it again."
   [cfg {:keys [team-id]}]
-  (let [bytes (recompute-team-storage cfg team-id)]
+  (let [bytes (recompute cfg team-id)]
     (l/trc :hint "team storage recomputed"
            :team-id (str team-id)
            :bytes bytes)
@@ -315,7 +314,7 @@
           0
           team-ids))
 
-(defn execute-schedule-team-storage
+(defn execute-schedule
   "Stream every dirty team oldest-first and enqueue one recompute job
   per team, staggered by chunk so the queue does not spike. Runs
   inside the caller read-only transaction (the job-def handler opens
@@ -373,7 +372,7 @@
      ;; runs in one read transaction. The chunk submits open their
      ;; own writable transactions (see db/own-transaction).
      (-> (assoc cfg ::db/read-only true)
-         (db/tx-run! execute-schedule-team-storage)))})
+         (db/tx-run! execute-schedule)))})
 
 (defmethod ig/init-key ::worker-job-def
   [_ cfg]
@@ -383,4 +382,4 @@
    ::jobs/validator (sm/validator schema:recompute-team-storage-params)
    ::jobs/handler
    (fn [_context params]
-     (db/tx-run! cfg execute-recompute-team-storage params))})
+     (db/tx-run! cfg execute-recompute params))})

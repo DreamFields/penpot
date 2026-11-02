@@ -25,7 +25,7 @@
    [integrant.core :as ig]
    [promesa.exec :as px]))
 
-(def ^:private gc-batch-size
+(def ^:private batch-size
   "Rows per delete: a big buffer is cleaned in bounded statements, each
   one its own snapshot, so the job heartbeats between batches."
   5000)
@@ -83,7 +83,7 @@
   "Run a batched DELETE until it removes nothing. Returns the total."
   [cfg xid seq]
   (loop [total 0]
-    (let [n (db/get-update-count (db/exec-one! cfg [sql:delete-batch xid seq gc-batch-size]))]
+    (let [n (db/get-update-count (db/exec-one! cfg [sql:delete-batch xid seq batch-size]))]
       (if (pos? ^long (or n 0))
         (do
           (jobs/heartbeat cfg)
@@ -91,7 +91,7 @@
           (recur (+ total ^long n)))
         total))))
 
-(defn gc-audit-log
+(defn delete-consumed
   "Delete the rows every enabled consumer has already passed. The
   position is the oldest enabled cursor, inclusive (the cursor points at
   the last row the consumer processed); a consumer that is off does not
@@ -123,7 +123,7 @@
 ;; JOB
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(def schema:audit-log-gc-params
+(def schema:params
   "Params of the GC job: none. Cron submits {}; system deps (pool,
   metrics) live on the job-def cfg closed over by the handler."
   [:map {:closed true}])
@@ -137,11 +137,11 @@
   [_ cfg]
   (l/dbg :hint "audit log GC job initialized")
   {::jobs/name      :audit-log-gc
-   ::jobs/schema    schema:audit-log-gc-params
+   ::jobs/schema    schema:params
    ::jobs/handler
    (fn [_context _params]
-     (let [total (gc-audit-log cfg)]
+     (let [total (delete-consumed cfg)]
        (l/dbg :hint "audit log buffer cleaned" :discarded total)
        total))
-   ::jobs/decoder   (sm/decoder schema:audit-log-gc-params sm/json-transformer)
-   ::jobs/validator (sm/validator schema:audit-log-gc-params)})
+   ::jobs/decoder   (sm/decoder schema:params sm/json-transformer)
+   ::jobs/validator (sm/validator schema:params)})

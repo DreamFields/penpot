@@ -28,7 +28,7 @@
    [app.setup :as-alias setup]
    [integrant.core :as ig]))
 
-(defn- generate-nexus-uri
+(defn- generate-uri
   "Joins relative path segments to the Nexus backend URI, same shape
   as the admin-console helper in `app.nitrate` (there the ingest path
   is `api/audit-log`; here it is `api/audit`).
@@ -45,7 +45,7 @@
   skipping silently."
   [cfg]
   (or (some-> (::uri cfg) u/uri)
-      (generate-nexus-uri "api/audit")
+      (generate-uri "api/audit")
       (ex/raise :type :internal
                 :code :task-not-configured
                 :hint "consumer task not configured, missing uri")))
@@ -58,7 +58,7 @@
         (subs s 0 limit)
         s))))
 
-(defn- send-to-nexus
+(defn- send-events
   "POST events to Nexus. Returns the number of events sent; throws on
   transport failure or non-204 refusal, carrying the attempted count
   as :events in the error data so the caller records the failure.
@@ -91,16 +91,16 @@
                        :resp-body (truncate-body (:body resp) 500)
                        :events n)))))
 
-(defn- process-nexus-chunk
+(defn- process-chunk
   "Send one chunk of the stream to Nexus. Returns {:processed n}; throws
   on refusal, so the chunk rolls back and the cursor stays where it was.
   No metrics here: a normal return means the transaction committed, so
   the caller records the success."
   [cfg rows]
   (let [events (mapv (comp consumers/row->event consumers/decode-row) rows)
-        ;; send-to-nexus returns the count or throws: a refusal
+        ;; send-events returns the count or throws: a refusal
         ;; aborts the pass, the rows stay for the next one.
-        n      (send-to-nexus cfg events)]
+        n      (send-events cfg events)]
 
     (l/trc :hint "consumer events chunk"
            :consumer "nexus"
@@ -108,7 +108,14 @@
 
     {:processed n :skipped 0}))
 
-(declare execute-audit-log-consumer-nexus)
+(defn run-pass
+  "One pass of the Nexus consumer: drain the stream from its cursor up to
+  the frontier of the pass. The loop of `::consumer` calls it once per
+  pass; direct callers (REPL, tests) get the same behavior."
+  [cfg]
+  (consumers/drain-consumer (assoc cfg ::uri (resolve-uri cfg))
+                            consumers/nexus
+                            process-chunk))
 
 (defmethod ig/assert-key ::consumer
   [_ cfg]
@@ -128,20 +135,11 @@
 
 (defmethod ig/init-key ::consumer
   [_ cfg]
-  (consumers/init-consumer-component cfg
-                                     consumers/consumer-nexus
-                                     prepare
-                                     execute-audit-log-consumer-nexus))
+  (consumers/init-component cfg
+                            consumers/nexus
+                            prepare
+                            run-pass))
 
 (defmethod ig/halt-key! ::consumer
   [_ thread]
-  (consumers/halt-consumer-component thread))
-
-(defn execute-audit-log-consumer-nexus
-  "One pass of the Nexus consumer: drain the stream from its cursor up to
-  the frontier of the pass. The loop of `::consumer` calls it once per
-  pass; direct callers (REPL, tests) get the same behavior."
-  [cfg]
-  (consumers/drain-consumer (assoc cfg ::uri (resolve-uri cfg))
-                            consumers/consumer-nexus
-                            process-nexus-chunk))
+  (consumers/halt-component thread))

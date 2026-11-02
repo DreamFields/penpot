@@ -526,7 +526,7 @@
                     (let [created? (= id (:id result))]
                       (db/after-commit
                        #(if created?
-                          (metrics/record-submitted cfg job-name)
+                          (metrics/record-created cfg job-name)
                           (metrics/record-refreshed cfg job-name)))
                       (l/trc :hint "submit"
                              :outcome (if created? "created" "refreshed")
