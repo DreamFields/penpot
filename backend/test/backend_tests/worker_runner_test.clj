@@ -82,7 +82,7 @@
 (defn- make-metrics []
   (ig/init-key :app.metrics/metrics
                {:default (select-keys main/default-metrics
-                                      [:jobs-queue-wait-timing
+                                      [:jobs-claim-wait-timing
                                        :jobs-execution-timing
                                        :jobs-total-timing
                                        :tasks-timing])}))
@@ -241,7 +241,7 @@
           (t/is (not (contains? context :queue))
                 "the tenant-prefixed queue is a routing detail, not context"))))))
 
-(t/deftest runner-records-queue-wait-execution-and-total
+(t/deftest runner-records-claim-wait-execution-and-total
   (let [metrics (make-metrics)
         cfg     (assoc (mk-cfg {}) ::mtx/metrics metrics)
         at      (ct/truncate (ct/now) :millisecond)
@@ -249,14 +249,14 @@
     (push-payload job-id at)
     (run-one cfg)
     (t/is (= 1 (histogram-sample-count metrics
-                                       :jobs-queue-wait-timing
-                                       ["echo-runner" "test"])))
+                                       :jobs-claim-wait-timing
+                                       ["echo-runner"])))
     (t/is (= 1 (histogram-sample-count metrics
                                        :jobs-execution-timing
-                                       ["echo-runner" "test"])))
+                                       ["echo-runner"])))
     (t/is (= 1 (histogram-sample-count metrics
                                        :jobs-total-timing
-                                       ["echo-runner" "test" "completed"])))
+                                       ["echo-runner" "completed"])))
     (t/testing "the legacy histogram is still emitted, with its raw name label"
       (t/is (= 1 (histogram-sample-count metrics
                                          :tasks-timing

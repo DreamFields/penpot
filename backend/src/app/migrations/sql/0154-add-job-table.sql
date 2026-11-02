@@ -20,7 +20,9 @@
 -- as an equality the filter is something an index can serve, where a
 -- `<tenant>:<queue>` prefix could only be matched with a LIKE over text. Every
 -- query that acts on one instance's work (dispatch, orphan sweep, reschedule,
--- cron no-overlap check, submit dedupe) filters on `tenant` for that reason.
+-- cron no-overlap check) filters on `tenant` for that reason, and the tenant
+-- leads the keys of the submit dedupe and exclusivity indexes (see 0159 and
+-- 0162).
 -- The prefix still exists, but only in the Redis key the queue's payloads
 -- travel through, composed in one place by `app.worker/queue-key`.
 --
@@ -84,9 +86,10 @@ CREATE INDEX job__profile__idx
     ON job (profile_id, created_at DESC)
     WHERE profile_id IS NOT NULL;
 
--- Cron no-overlap check and submit dedupe: both look for jobs of one
--- tenant with the same name and queue and label that have not started
--- yet, so one index serves the two queries.
+-- Cron no-overlap check: it looks for the jobs of one tenant with the same
+-- name, queue and label that have not started yet. The dedupe of the submit
+-- does not read it: that one is the unique index over the not-started dedupe
+-- jobs (see 0162).
 CREATE INDEX job__name_label__idx
     ON job (tenant, name, queue, label)
     WHERE status IN ('new', 'scheduled', 'running', 'retry');
@@ -140,9 +143,9 @@ CREATE INDEX job_event__job_kind_created_idx
 -- jobs GC, which also marks the referenced storage objects as touched in
 -- the same transaction; a stray `DELETE FROM job` would drop the row
 -- (and cascade `job_event`) without touching the object, orphaning it
--- forever. The GC and the submit dedupe disable the guard inside their
--- transaction with `SET LOCAL rules.deletion_protection TO off`, the
--- same escape hatch used by `app.tasks.objects-gc`.
+-- forever. The jobs GC disables the guard inside its transaction with
+-- `SET LOCAL rules.deletion_protection TO off`, the same escape hatch used
+-- by `app.tasks.objects-gc`; `app.jobs/submit` never deletes.
 CREATE OR REPLACE TRIGGER deletion_protection__tgr
 BEFORE DELETE ON job FOR EACH STATEMENT
   WHEN ((current_setting('rules.deletion_protection', true) IN ('on', '')) OR

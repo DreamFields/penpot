@@ -544,7 +544,10 @@
     :fn (mg/resource "app/migrations/sql/0160-add-audit-log-cursor.sql")}
 
    {:name "0161-drop-audit-log-pending"
-    :fn (mg/resource "app/migrations/sql/0161-drop-audit-log-pending.sql")}])
+    :fn (mg/resource "app/migrations/sql/0161-drop-audit-log-pending.sql")}
+
+   {:name "0162-add-job-dedupe-column"
+    :fn (mg/resource "app/migrations/sql/0162-add-job-dedupe-column.sql")}])
 
 (defn apply-migrations!
   [pool name migrations]

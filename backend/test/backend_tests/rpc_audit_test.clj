@@ -14,6 +14,7 @@
    [app.db :as db]
    [app.jobs :as-alias jobs]
    [app.loggers.audit :as audit]
+   [app.loggers.webhooks :as-alias webhooks]
    [app.main :as main]
    [app.metrics :as mtx]
    [app.metrics.definition :as-alias mdef]
@@ -954,3 +955,37 @@
       (t/is (= 1.0 (ingest-counter metrics "full" "inserted")))
       (t/is (= #{["full" "inserted"]} (counter-label-sets metrics)))
       (t/is (= 1 (count (th/db-exec! ["select * from audit_log"])))))))
+
+(t/deftest backend-webhook-batch-debounces-on-the-pending-job
+  ;; Two events of the same batch key share one pending job: the second
+  ;; moves its schedule and leaves the last payload behind, so the
+  ;; receiver is told once about the burst and with the newest event.
+  (with-redefs [cf/flags #{:webhooks}]
+    (let [prof  (th/create-profile* 1 {:is-active true})
+          label "rpc:update-file:the-key"
+          event (fn [n batch-timeout]
+                  {:id (uuid/next)
+                   :type "action"
+                   :name "update-file"
+                   :profile-id (:id prof)
+                   :props {:n n}
+                   :context {:version "2.0.0" :initiator "app"}
+                   :tracked-at (ct/now)
+                   :created-at (ct/now)
+                   :source "backend"
+                   ::webhooks/event? true
+                   ::webhooks/batch-key "the-key"
+                   ::webhooks/batch-timeout batch-timeout})]
+      (audit/submit* th/*system* (event 1 (ct/duration "2m")))
+      (let [[row1 :as rows] (th/db-exec! ["select * from job where label = ?" label])]
+        (t/is (= 1 (count rows)))
+        (audit/submit* th/*system* (event 2 (ct/duration "1h")))
+        (let [[row2 :as rows] (th/db-exec! ["select * from job where label = ?" label])]
+          (t/is (= 1 (count rows)) "the burst keeps a single pending job")
+          (t/is (= (:id row1) (:id row2)) "and the job keeps its id")
+          (t/is (pos? (compare (:scheduled-at row2) (:scheduled-at row1)))
+                "the second event slides the window to its own delay")
+          (let [params (db/decode-json-pgobject (:params row2))
+                blob   (transit/decode-str (:event-blob params))]
+            (t/is (= 2 (get-in blob [:props :n]))
+                  "and the payload delivered is the last event")))))))

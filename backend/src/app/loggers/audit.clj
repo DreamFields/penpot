@@ -320,14 +320,17 @@
                             (ifn? batch-key)    (dm/str label ":" (batch-key (::rpc/params event)))
                             (string? batch-key) (dm/str label ":" batch-key)
                             :else               label)
-            dedupe?       (boolean (and batch-key batch-timeout))]
+            debounce?     (boolean (and batch-key batch-timeout))]
 
         (jobs/submit cfg
                      {::jobs/name :process-webhook-event
                       ::jobs/queue :webhooks
                       ::jobs/max-retries 0
                       ::jobs/delay (or batch-timeout 0)
-                      ::jobs/dedupe dedupe?
+                      ;; A batch slides its window with every event and
+                      ;; delivers the last payload, so the receiver is
+                      ;; told once about the whole burst.
+                      ::jobs/debounce debounce?
                       ::jobs/label label
                       ;; The event travels as an opaque transit blob:
                       ;; transit preserves the instant/UUID/set types

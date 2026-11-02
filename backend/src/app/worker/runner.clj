@@ -111,10 +111,9 @@
 
       (do
         (let [job-def   (jobs/get-job-def defs (:name job))
-              _         (jobs-metrics/record-queue-wait
+              _         (jobs-metrics/record-claim-wait
                          cfg
                          (::jobs/name job-def)
-                         queue
                          (- (inst-ms (ct/now)) (inst-ms (:scheduled-at job))))
               params    (try
                           (->> (:params job)
@@ -140,7 +139,6 @@
                               (jobs-metrics/record-execution
                                cfg
                                (:name job)
-                               queue
                                (inst-ms (tpoint)))
                               (jobs-metrics/record-legacy-execution
                                cfg

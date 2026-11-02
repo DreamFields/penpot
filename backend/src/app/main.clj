@@ -27,7 +27,6 @@
    [app.http.websocket :as http.ws]
    [app.jobs :as-alias jobs]
    [app.jobs.gc :as-alias jobs.gc]
-   [app.jobs.metrics :as jobs-metrics]
    ;; The consumer transports live in their own namespaces; they are
    ;; required here for their side effect: the `ig/init-key` method of
    ;; their job-def has to be registered before the components start.
@@ -127,12 +126,11 @@
 
    :tasks-timing
    {::mdef/name "penpot_tasks_timing"
-    ;; Deprecated: superseded by `penpot_jobs_execution_ms`, which adds a
-    ;; queue label. Kept only for existing dashboards and alerts. The help
-    ;; text is what someone reading /metrics sees, so it is where the
-    ;; redirect belongs: the name and the labels stay untouched, so no
-    ;; panel or alert breaks.
-    ::mdef/help "Deprecated: use penpot_jobs_execution_ms, which adds a queue label."
+    ;; Deprecated: superseded by `penpot_jobs_execution_ms`. Kept only for
+    ;; existing dashboards and alerts. The help text is what someone reading
+    ;; /metrics sees, so it is where the redirect belongs: the name and the
+    ;; labels stay untouched, so no panel or alert breaks.
+    ::mdef/help "Deprecated: use penpot_jobs_execution_ms. Kept for existing dashboards and alerts."
     ::mdef/labels ["name"]
     ::mdef/buckets mtx/default-tasks-histogram-buckets
     ::mdef/type :histogram}
@@ -268,28 +266,22 @@
     ::mdef/help "Total number of handler errors in the http listener."
     ::mdef/type :counter}
 
-   :jobs-submitted
-   {::mdef/name "penpot_jobs_submitted_total"
-    ::mdef/help "Total number of durable jobs submitted."
-    ::mdef/labels ["name" "queue"]
-    ::mdef/type :counter}
-
-   :jobs-skipped
-   {::mdef/name "penpot_jobs_skipped_total"
-    ::mdef/help "Total number of durable job submissions skipped by skip-if-active."
-    ::mdef/labels ["name" "queue"]
+   :jobs-submit
+   {::mdef/name "penpot_jobs_submit_total"
+    ::mdef/help "Total number of durable job submissions by outcome: created, skipped or refreshed."
+    ::mdef/labels ["name" "outcome"]
     ::mdef/type :counter}
 
    :jobs-dispatched
    {::mdef/name "penpot_jobs_dispatched_total"
-    ::mdef/help "Total number of jobs pushed to a worker queue. Counts pushes, not claims: compare with the _count of penpot_jobs_queue_wait_ms."
-    ::mdef/labels ["name" "queue"]
+    ::mdef/help "Total number of jobs pushed to a worker queue. Counts pushes, not claims: compare with the _count of penpot_jobs_claim_wait_ms."
+    ::mdef/labels ["name"]
     ::mdef/type :counter}
 
    :jobs-retries
    {::mdef/name "penpot_jobs_retries_total"
     ::mdef/help "Total number of durable jobs rescheduled for retry."
-    ::mdef/labels ["name" "queue" "reason"]
+    ::mdef/labels ["name" "reason"]
     ::mdef/type :counter}
 
    :jobs-events-total
@@ -297,41 +289,35 @@
     ::mdef/help "Total number of job events stored."
     ::mdef/type :counter}
 
-   :jobs-orphaned
-   {::mdef/name "penpot_jobs_orphaned_total"
-    ::mdef/help "Total number of running jobs marked as orphaned."
-    ::mdef/labels ["queue"]
-    ::mdef/type :counter}
-
    :jobs-rescheduled
    {::mdef/name "penpot_jobs_rescheduled_total"
     ::mdef/help "Total number of scheduled jobs recovered after transit loss."
-    ::mdef/labels ["queue"]
+    ::mdef/labels ["name"]
     ::mdef/type :counter}
 
-   :jobs-queue-wait-timing
-   {::mdef/name "penpot_jobs_queue_wait_ms"
+   :jobs-claim-wait-timing
+   {::mdef/name "penpot_jobs_claim_wait_ms"
     ::mdef/help "Time from job scheduling to worker claim (milliseconds). Its _count counts claims, not pushes: compare with penpot_jobs_dispatched_total."
-    ::mdef/labels ["name" "queue"]
+    ::mdef/labels ["name"]
     ::mdef/type :histogram
     ::mdef/buckets [1 10 50 100 500 1000 5000 10000 30000 60000 300000 600000]}
 
    :jobs-execution-timing
    {::mdef/name "penpot_jobs_execution_ms"
     ::mdef/help "Time spent executing a job handler (milliseconds)."
-    ::mdef/labels ["name" "queue"]
+    ::mdef/labels ["name"]
     ::mdef/type :histogram
     ::mdef/buckets [1 10 50 100 500 1000 5000 10000 30000 60000 300000 600000]}
 
    :jobs-total-timing
    {::mdef/name "penpot_jobs_total_ms"
     ::mdef/help "Time from job creation to a terminal state (milliseconds). Its _count is the terminal total per outcome."
-    ::mdef/labels ["name" "queue" "outcome"]
+    ::mdef/labels ["name" "outcome"]
     ::mdef/type :histogram
     ::mdef/buckets [10 50 100 500 1000 5000 10000 30000 60000 300000 600000 3600000]}
 
-   :jobs-dispatcher-timing
-   {::mdef/name "penpot_jobs_dispatcher_ms"
+   :jobs-dispatcher-batch-timing
+   {::mdef/name "penpot_jobs_dispatcher_batch_ms"
     ::mdef/help "Dispatcher batch processing time (milliseconds)."
     ::mdef/labels ["stage" "outcome"]
     ::mdef/type :histogram
@@ -344,25 +330,14 @@
     ::mdef/type :histogram
     ::mdef/buckets [1 5 10 25 50 100 250 500 1000]}
 
-   :jobs-backlog
-   {::mdef/name "penpot_jobs_backlog"
-    ::mdef/help "Current number of jobs grouped by status."
-    ::mdef/labels ["status"]
-    ::mdef/type :gauge}
-
-   :jobs-oldest-pending-age
-   {::mdef/name "penpot_jobs_oldest_pending_age_seconds"
-    ::mdef/help "Age in seconds of the oldest pending job."
-    ::mdef/type :gauge}
-
    :jobs-gc-rows
    {::mdef/name "penpot_jobs_gc_rows_total"
     ::mdef/help "Rows removed or resources touched by the jobs garbage collector."
     ::mdef/labels ["kind" "action"]
     ::mdef/type :counter}
 
-   :jobs-gc-timing
-   {::mdef/name "penpot_jobs_gc_ms"
+   :jobs-gc-pass-timing
+   {::mdef/name "penpot_jobs_gc_pass_ms"
     ::mdef/help "Time spent in each jobs garbage collection pass (milliseconds)."
     ::mdef/labels ["kind"]
     ::mdef/type :histogram
@@ -951,10 +926,6 @@
     ::mtx/metrics (ig/ref ::mtx/metrics)
     ::db/pool     (ig/ref ::db/pool)
     ::wrk/tenant  (cf/get :tenant)}
-
-   ::jobs-metrics/sampler
-   {::db/pool     (ig/ref ::db/pool)
-    ::mtx/metrics (ig/ref ::mtx/metrics)}
 
    [::default ::wrk/runner]
    {::wrk/parallelism (cf/get :worker-default-parallelism 1)

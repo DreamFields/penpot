@@ -56,8 +56,8 @@
              "id" "name" "tenant" "queue" "label" "priority" "scheduled_at"
              "retry_num" "max_retries" "status" "created_at" "modified_at"
              "started_at" "completed_at" "params"
-             ; the jobs that asked for the exclusivity of their key
-             "exclusive"
+             ; the jobs that resolved their key in the database
+             "exclusive" "dedupe"
              ; optional ledger columns
              "profile_id" "error" "result"
              "resource_id" "expires_at"}
@@ -135,7 +135,8 @@
   (t/is (contains? (table-indexes "job") "job__dispatcher__idx"))
   (t/is (contains? (table-indexes "job") "job__orphan__idx"))
   (t/is (contains? (table-indexes "job") "job__profile__idx"))
-  (t/is (contains? (table-indexes "job") "job__live_exclusive__uniq")))
+  (t/is (contains? (table-indexes "job") "job__live_exclusive__uniq"))
+  (t/is (contains? (table-indexes "job") "job__new_dedupe__uniq")))
 
 (t/deftest audit-log-has-a-consumer-cursor
   (t/testing "the position columns and their covering index exist"
@@ -170,8 +171,31 @@
     (t/is (str/includes? (indexdef "job__orphan__idx") "(tenant, modified_at)")))
   (t/testing "reschedule of lost scheduled rows"
     (t/is (str/includes? (indexdef "job__scheduled__idx") "(tenant, scheduled_at)")))
-  (t/testing "submit dedupe"
+  (t/testing "cron no-overlap check"
     (t/is (str/includes? (indexdef "job__name_label__idx") "(tenant, name, queue, label)"))))
+
+(t/deftest job-new-dedupe-index-admits-one-not-started-row-per-key
+  ;; The dedupe of a submit is the index, not a delete before the insert:
+  ;; it is unique, it covers the whole key, and it only holds the rows
+  ;; that asked for the option and have not started yet.
+  (let [def (indexdef "job__new_dedupe__uniq")]
+    (t/is (str/includes? def "CREATE UNIQUE INDEX"))
+    (t/is (str/includes? def "(tenant, name, queue, label)"))
+    (t/is (str/includes? def "dedupe"))
+    (t/testing "only the not-started status is covered"
+      (t/is (str/includes? def "'new'"))
+      (doseq [status ["scheduled" "running" "retry"]]
+        (t/is (not (str/includes? def (str "'" status "'")))
+              (str "the " status " status leaves the index"))))))
+
+(t/deftest job-dedupe-migration-is-idempotent
+  ;; The out-of-band runbook of 0162 pre-applies the whole migration (the
+  ;; `dedupe` column and then the `CONCURRENTLY` index), so the migration
+  ;; must find both and do nothing when it runs afterwards.
+  (let [apply! (mg/resource "app/migrations/sql/0162-add-job-dedupe-column.sql")]
+    (t/is (true? (apply! th/*pool*)))
+    (t/is (contains? (table-columns "job") "dedupe"))
+    (t/is (contains? (table-indexes "job") "job__new_dedupe__uniq"))))
 
 (t/deftest job-live-exclusive-index-admits-one-live-row-per-key
   ;; The exclusion of the live jobs is the index, not a check that races

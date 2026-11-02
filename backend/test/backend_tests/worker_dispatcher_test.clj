@@ -47,12 +47,12 @@
 (defn- make-metrics []
   (ig/init-key :app.metrics/metrics
                {:default (select-keys main/default-metrics
-                                      [:jobs-dispatcher-timing])}))
+                                      [:jobs-dispatcher-batch-timing])}))
 
 (defn- make-orphan-metrics []
   (ig/init-key :app.metrics/metrics
                {:default (select-keys main/default-metrics
-                                      [:jobs-orphaned :jobs-total-timing])}))
+                                      [:jobs-total-timing])}))
 
 (defn- counter-value [metrics id labels]
   (let [collector (mtx/get-collector metrics id)
@@ -195,6 +195,20 @@
         (t/is (= 1 (count (drain-queue "test"))))
         (t/is (= "scheduled" (:status fresh)))))))
 
+(t/deftest dispatcher-reschedule-records-the-job-name
+  (let [metrics (ig/init-key :app.metrics/metrics
+                             {:default (select-keys main/default-metrics
+                                                    [:jobs-rescheduled])})
+        cfg     (assoc (mk-cfg) ::mtx/metrics metrics)]
+    (mk-job {:status       "scheduled"
+             :scheduled-at (ct/minus (ct/now)
+                                     (ct/duration {:minutes 6}))})
+    (wdisp/run-batch cfg)
+    (t/testing "the name comes from the RETURNING of the sweep"
+      (t/is (= 1.0 (counter-value metrics :jobs-rescheduled ["test-job"]))))
+    (t/testing "the queue is not a label any more"
+      (t/is (= 0.0 (counter-value metrics :jobs-rescheduled ["test"]))))))
+
 (t/deftest dispatcher-marks-stale-running-jobs-as-aborted-by-lease
   (let [cfg    (mk-cfg)
         stale  (mk-job {:status     "running"
@@ -218,7 +232,7 @@
     (t/testing "recent running job is not touched"
       (t/is (= "running" (:status (get-row fresh)))))))
 
-(t/deftest dispatcher-orphan-sweep-records-orphan-and-terminal-metrics
+(t/deftest dispatcher-orphan-sweep-records-the-terminal-counter
   (let [metrics (make-orphan-metrics)
         cfg     (assoc (mk-cfg) ::mtx/metrics metrics)
         _       (mk-job {:status     "running"
@@ -226,8 +240,8 @@
                                                 (ct/plus (cf/get-jobs-lease)
                                                          (ct/duration {:minutes 1})))})]
     (wdisp/run-batch cfg)
-    (t/is (= 1.0 (counter-value metrics :jobs-orphaned ["test"])))
-    (t/is (= 1 (histogram-sample-count metrics ["test-job" "test" "aborted"])))))
+    (t/testing "the _count of the aborted outcome is the orphan count"
+      (t/is (= 1 (histogram-sample-count metrics ["test-job" "aborted"]))))))
 
 (t/deftest dispatcher-batch-without-pending-jobs-signals-wait
   (let [cfg (mk-cfg)]

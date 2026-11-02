@@ -1023,7 +1023,7 @@
   the whole table, and enqueues the job instead of running it inline, so it
   can be used against production in bounded batches. The job is idempotent (it
   only marks the children with the row's own date), `label` is the row id and
-  `dedupe` drops not-yet-due duplicates.
+  `dedupe` skips the row when its job is still not started.
 
   Options: `:limit` (max rows read), `:ids` (restrict the run to these row ids)
   and `:dry-run?` (count without enqueueing). `table` and `object` are internal

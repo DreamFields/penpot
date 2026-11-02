@@ -73,7 +73,7 @@
               AND t.tenant = ?
               AND t.scheduled_at < ?::timestamptz - '5 min'::interval) AS subquery
     WHERE job.id=subquery.id
-RETURNING job.id, job.queue")
+RETURNING job.id, job.name, job.queue")
 
 (def ^:private sql:mark-orphan
   "UPDATE job
@@ -109,9 +109,10 @@ RETURNING job.id, job.queue, job.name, job.created_at")
                        {:return-keys true})]
     (db/after-commit
      (fn []
-       (doseq [{:keys [id queue]} rows]
-         (metrics/record-rescheduled cfg queue)
+       (doseq [{:keys [id name queue]} rows]
+         (metrics/record-rescheduled cfg name)
          (l/wrn :hint "reschedule"
+                :name name
                 :id (str id)
                 :tenant tenant
                 :queue queue))))))
@@ -126,7 +127,8 @@ RETURNING job.id, job.queue, job.name, job.created_at")
     ;; its `end` events too: one bulk insert in the same transaction (never
     ;; one insert per orphan) keeps the history consistent with the rows.
     ;; No msgbus notification: orphans alert through the error log and the
-    ;; orphaned counter, like before.
+    ;; `aborted` outcome of `penpot_jobs_total_ms`, whose `_count` is the
+    ;; orphan count.
     (when (seq rows)
       (db/exec-one! conn [sql:insert-orphan-events
                           (db/create-array conn "uuid" (map :id rows))
@@ -134,10 +136,8 @@ RETURNING job.id, job.queue, job.name, job.created_at")
     (db/after-commit
      (fn []
        (doseq [{:keys [id queue name created-at]} rows]
-         (metrics/record-orphan cfg queue)
-         (when (ct/inst? created-at)
-           (metrics/record-total cfg name queue :aborted
-                                 (- (inst-ms timestamp) (inst-ms created-at))))
+         (metrics/record-total cfg name :aborted
+                               (- (inst-ms timestamp) (inst-ms created-at)))
          (l/err :hint "marked job as aborted (orphan lease expired)"
                 :id (str id)
                 :tenant tenant
@@ -168,7 +168,7 @@ RETURNING job.id, job.queue, job.name, job.created_at")
     (rds/rpush conn key items)
     (metrics/record-dispatcher-size cfg queue (count jobs))
     (doseq [{:keys [id name queue]} jobs]
-      (metrics/record-dispatched cfg name queue 1)
+      (metrics/record-dispatched cfg name 1)
       (l/trc :hist "schedule"
              :tenant tenant
              :queue queue
